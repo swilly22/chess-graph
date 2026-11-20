@@ -1,0 +1,34 @@
+{
+  "month": "2026-10",
+  "limit": 1000000,
+  "engine": "duckdb",
+  "scanned": 1610941,
+  "accepted": 1000000,
+  "accept_rate": 0.6208,
+  "rejections": {
+    "variant": 0,
+    "unrated": 5375,
+    "rating_missing": 0,
+    "rating_diff": 27907,
+    "time_control": 577502,
+    "result": 157
+  },
+  "san_errors": 0,
+  "aggregate_seconds": 1673.1,
+  "games_per_second": 598.0,
+  "positions_before_prune": 17883657,
+  "positions_after_prune": 49027,
+  "edges_before_prune": 18299779,
+  "edges_after_prune": 74443,
+  "peak_rss_mb": 7923.0,
+  "loaded": true,
+  "load": {
+    "nodes_loaded": 49027,
+    "edges_loaded": 74443,
+    "node_seconds": 1.7,
+    "edge_seconds": 6.5,
+    "graph_node_count": 49027,
+    "graph_edge_count": 74443,
+    "graph_memory_mb": 84.0
+  }
+}

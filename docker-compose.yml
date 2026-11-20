@@ -1,0 +1,32 @@
+# FalkorDB for the chess position graph.
+# RESP/Redis protocol on 6379 (the API and pipeline talk to this).
+# Browser UI on 3000 (humans only; never exposed to app clients).
+#
+#   docker compose up -d        # start
+#   docker compose ps           # status / health
+#   docker compose logs -f      # follow logs
+#   docker compose down         # stop (data persists in the named volume)
+#   docker compose down -v      # stop AND wipe the graph volume
+services:
+  falkordb:
+    image: falkordb/falkordb:latest
+    container_name: chess_falkordb
+    ports:
+      - "6379:6379" # RESP protocol — Cypher via GRAPH.QUERY
+      - "3000:3000" # FalkorDB Browser (web UI)
+    volumes:
+      - falkordb_data:/data
+    # Tuning is passed to the module via FALKORDB_ARGS. Defaults are fine for
+    # the sample build; revisit NODE_CREATION_BUFFER / query mem at full scale.
+    environment:
+      # Persist an RDB snapshot so a restart doesn't lose a built graph.
+      - REDIS_ARGS=--save 300 1000 --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+volumes:
+  falkordb_data:

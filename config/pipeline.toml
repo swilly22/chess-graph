@@ -1,0 +1,40 @@
+# Pipeline thresholds. Code reads these; it never hard-codes them.
+# Every value here is provisional until phase 2 measurements land (see CLAUDE.md).
+
+[ingestion]
+# Standard variant, rated games only. Bullet/ultrabullet excluded via time_control.
+variant = "standard"
+rated_only = true
+# Process only the opening: the first N plies of each game.
+depth_cap_plies = 30
+# Skip games where |white_elo - black_elo| exceeds this (provisional).
+max_rating_diff = 400
+
+[time_control]
+# Estimated duration seconds = base + increment_multiplier * increment.
+# Below bullet_max is bullet (EXCLUDED). Below blitz_max is blitz. Else slow.
+increment_multiplier = 40
+bullet_max_seconds = 180
+blitz_max_seconds = 480
+
+[rating_brackets]
+# Six buckets, ALWAYS indexed in this order. A game's bracket is the average
+# of both players' ratings. Edges are the lower bounds of buckets 1..5.
+# bucket 0: <1200, 1: 1200-1499, 2: 1500-1799, 3: 1800-2099, 4: 2100-2399, 5: 2400+
+edges = [1200, 1500, 1800, 2100, 2400]
+labels = ["<1200", "1200-1499", "1500-1799", "1800-2099", "2100-2399", "2400+"]
+
+[pruning]
+# After aggregation keep positions with at least this many games,
+# then keep only edges whose endpoints both survive.
+min_games_per_position = 20
+
+[sample]
+# Phase 2 target. "Ask before downloading full monthly dumps."
+target_games = 1_000_000
+
+[falkordb]
+host = "localhost"
+port = 6379
+core_graph = "chess_core"
+batch_rows = 10_000

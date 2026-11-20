@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+
+# Data dumps and intermediates — never commit the Lichess dumps or aggregates.
+data/
+*.pgn
+*.pgn.zst
+*.jsonl
+*.jsonl.zst
+*.parquet
+*.duckdb
+
+# Local env / secrets
+.env
+.env.local
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
