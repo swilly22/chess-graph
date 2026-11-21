@@ -438,6 +438,9 @@ def main(argv: list[str] | None = None) -> int:
     emp = sub.add_parser("enrich-min-ply", help="compute min_ply (BFS from start) over chess_core")
     emp.add_argument("--report", default=None, help="write the JSON report to this path")
 
+    est = sub.add_parser("enrich-structures", help="link positions to pawn structures")
+    est.add_argument("--report", default=None, help="write the JSON report to this path")
+
     args = parser.parse_args(argv)
     cfg = load_config()
 
@@ -463,6 +466,12 @@ def main(argv: list[str] | None = None) -> int:
         from chess_graph.enrich.min_ply import enrich_min_ply
 
         report = _asdict(enrich_min_ply(cfg))
+    elif args.command == "enrich-structures":
+        from dataclasses import asdict as _asdict
+
+        from chess_graph.enrich.pawn_structure import enrich_structures
+
+        report = _asdict(enrich_structures(cfg))
     else:
         return 1
 
