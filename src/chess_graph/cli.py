@@ -445,6 +445,13 @@ def main(argv: list[str] | None = None) -> int:
     eop.add_argument("--dir", default="data/openings", help="dir with a.tsv..e.tsv")
     eop.add_argument("--report", default=None, help="write the JSON report to this path")
 
+    eev = sub.add_parser("enrich-evals", help="local Stockfish evals over positions + edges")
+    eev.add_argument("--depth", type=int, default=None, help="fixed depth (else use --movetime)")
+    eev.add_argument("--movetime", type=int, default=120, help="ms per position")
+    eev.add_argument("--jobs", type=int, default=6, help="parallel Stockfish engines")
+    eev.add_argument("--limit", type=int, default=None, help="only evaluate N positions (testing)")
+    eev.add_argument("--report", default=None, help="write the JSON report to this path")
+
     args = parser.parse_args(argv)
     cfg = load_config()
 
@@ -482,6 +489,15 @@ def main(argv: list[str] | None = None) -> int:
         from chess_graph.enrich.openings import enrich_openings
 
         report = _asdict(enrich_openings(cfg, args.dir))
+    elif args.command == "enrich-evals":
+        from dataclasses import asdict as _asdict
+
+        from chess_graph.enrich.evals import enrich_evals
+
+        report = _asdict(
+            enrich_evals(cfg, depth=args.depth, movetime_ms=args.movetime,
+                         jobs=args.jobs, limit=args.limit)
+        )
     else:
         return 1
 
