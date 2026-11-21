@@ -8,6 +8,8 @@ CFLAGS ?= -O2 -std=c11 -Wall -Wextra
 
 ENGINE_SRC := $(wildcard engine/Source/*.c)
 ENGINE_INC := -Iengine/Include -Iengine/Source
+ZSTD_CFLAGS := $(shell pkg-config --cflags libzstd 2>/dev/null)
+ZSTD_LIBS := $(shell pkg-config --libs libzstd 2>/dev/null || echo -lzstd)
 
 hash_fen: hash_fen.c chessid.c chessid.h polyglot_random.h
 	$(CC) $(CFLAGS) -o hash_fen hash_fen.c chessid.c
@@ -15,7 +17,11 @@ hash_fen: hash_fen.c chessid.c chessid.h polyglot_random.h
 replay_games: replay_games.c replay.c replay.h chessid.c chessid.h polyglot_random.h $(ENGINE_SRC)
 	$(CC) $(CFLAGS) $(ENGINE_INC) -I. -o replay_games replay_games.c replay.c chessid.c $(ENGINE_SRC)
 
+producer: producer.c replay.c replay.h chessid.c chessid.h polyglot_random.h $(ENGINE_SRC)
+	$(CC) $(CFLAGS) $(ENGINE_INC) -I. $(ZSTD_CFLAGS) -o producer \
+		producer.c replay.c chessid.c $(ENGINE_SRC) $(ZSTD_LIBS)
+
 clean:
-	rm -f hash_fen replay_games
+	rm -f hash_fen replay_games producer
 
 .PHONY: clean
