@@ -8,6 +8,9 @@ for ingestion. Download is I/O-bound, so threads (not processes) are fine.
 
 from __future__ import annotations
 
+import os
+import re
+import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 from urllib.error import HTTPError, URLError
@@ -75,6 +78,49 @@ def parallel_fetch(url: str, out_path: str, n_bytes: int, conns: int) -> int:
     with ThreadPoolExecutor(max_workers=len(ranges)) as pool:
         futures = [pool.submit(_fetch_range, url, s, e, out_path) for s, e in ranges]
         return sum(f.result() for f in futures)
+
+
+def run_fused(
+    url: str,
+    producer: str,
+    shards_dir: str,
+    conns: int,
+    total_bytes: int | None = None,
+    margin: int = 8 << 20,
+) -> tuple[int, int]:
+    """Fully overlapped: N connections each download a byte-range and pipe it to
+    a producer in range mode (frame-sync + own-whole-frames + skip leading
+    partial). Each pipe overlaps its own download with its replay. Returns
+    (scanned, accepted) summed. Shards land in shards_dir/r<i>/.
+    """
+    total = total_bytes or content_length(url)
+    span = total // conns
+    procs = []
+    for i in range(conns):
+        start = i * span
+        end = total - 1 if i == conns - 1 else min(total - 1, (i + 1) * span + margin - 1)
+        mode = "head" if i == 0 else "range"
+        subdir = os.path.join(shards_dir, f"r{i}")
+        os.makedirs(subdir, exist_ok=True)
+        curl = subprocess.Popen(
+            ["curl", "-sL", "-r", f"{start}-{end}", url], stdout=subprocess.PIPE
+        )
+        prod = subprocess.Popen(
+            [producer, "-", subdir, "0", "1", mode, str(span)],
+            stdin=curl.stdout, stderr=subprocess.PIPE, text=True,
+        )
+        curl.stdout.close()
+        procs.append((curl, prod))
+
+    scanned = accepted = 0
+    for curl, prod in procs:
+        _, err = prod.communicate()
+        curl.wait()
+        m = re.search(r"scanned=(\d+) accepted=(\d+)", err)
+        if m:
+            scanned += int(m.group(1))
+            accepted += int(m.group(2))
+    return scanned, accepted
 
 
 def estimate_prefix_bytes(url: str, accepted_target: int, bytes_per_scanned: int = 520,

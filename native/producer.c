@@ -267,6 +267,10 @@ typedef struct {
     long scanned, accepted, limit;
     Queue *q;
     int done;
+    int syncing;        // range mode: skip the leading partial game
+    int prev_blank;     // previous line was blank (for boundary detection)
+    long range_bytes;   // range mode: logical compressed span to own (0 = all)
+    size_t consumed;    // compressed bytes consumed from the range start
 } Reader;
 
 static void finish_game(Reader *rd) {
@@ -289,6 +293,16 @@ static void finish_game(Reader *rd) {
 
 static void handle_line(Reader *rd, char *line) {
     if (rd->done) return;
+    // Range mode: the stream starts mid-game (frame boundary fell inside a
+    // game). Discard lines until a clean game start ("[" right after a blank).
+    if (rd->syncing) {
+        if (rd->prev_blank && line[0] == '[') {
+            rd->syncing = 0;  // fall through and process this header normally
+        } else {
+            rd->prev_blank = (line[0] == '\0');
+            return;
+        }
+    }
     if (line[0] == '[') {
         const char *sp = strchr(line, ' ');
         const char *q1 = strchr(line, '"');
@@ -326,10 +340,69 @@ static void handle_line(Reader *rd, char *line) {
     }
 }
 
+// Decompress one input block and feed its text lines to the reader.
+static void process_input(ZSTD_DCtx *dctx, Reader *rd, const void *src, size_t srclen,
+                          char *out_buf, size_t out_cap, char *line, size_t *line_len,
+                          size_t line_cap) {
+    ZSTD_inBuffer input = {src, srclen, 0};
+    while (input.pos < input.size && !rd->done) {
+        ZSTD_outBuffer output = {out_buf, out_cap, 0};
+        size_t ret = ZSTD_decompressStream(dctx, &output, &input);
+        if (ZSTD_isError(ret)) { rd->done = 1; break; }
+        for (size_t i = 0; i < output.pos; i++) {
+            char ch = out_buf[i];
+            if (ch == '\n') {
+                size_t ll = *line_len;
+                if (ll && line[ll - 1] == '\r') ll--;
+                line[ll] = '\0';
+                handle_line(rd, line);
+                *line_len = 0;
+            } else if (*line_len + 1 < line_cap) {
+                line[(*line_len)++] = ch;
+            }
+        }
+        // Range mode: stop at the frame boundary (ret==0) once we've consumed our
+        // span. That boundary is exactly where the next range frame-syncs to, so
+        // whole frames are owned by exactly one range (no gap, no overlap).
+        if (ret == 0 && rd->range_bytes > 0 &&
+            (long)(rd->consumed + input.pos) >= rd->range_bytes) {
+            rd->done = 1;
+        }
+    }
+    rd->consumed += input.pos;  // compressed bytes consumed (for range stop)
+}
+
+// Range mode: a worker is handed an arbitrary byte range, so the stream starts
+// mid-file. Scan the first chunk for the next pzstd skippable-frame header
+// (magic 0x184D2A50, little-endian 50 2A 4D 18) — a clean frame boundary to
+// start decompression from. Returns the sync buffer (caller frees) and sets
+// *out_len / *out_off to the usable tail, or *out_off = -1 if not found.
+#define SYNC_MAX (8 << 20)
+static unsigned char *frame_sync(FILE *in, size_t *out_len, long *out_off) {
+    unsigned char *sb = malloc(SYNC_MAX);
+    size_t sn = 0;
+    long mp = -1;
+    while (sn < SYNC_MAX) {
+        size_t r = fread(sb + sn, 1, SYNC_MAX - sn, in);
+        if (r == 0) break;
+        size_t from = sn >= 3 ? sn - 3 : 0;  // allow magic straddling reads
+        sn += r;
+        for (size_t k = from; k + 4 <= sn; k++)
+            if (sb[k] == 0x50 && sb[k + 1] == 0x2A && sb[k + 2] == 0x4D && sb[k + 3] == 0x18) {
+                mp = (long)k;
+                break;
+            }
+        if (mp >= 0) break;
+    }
+    *out_len = sn;
+    *out_off = mp;
+    return sb;
+}
+
 // --- main -------------------------------------------------------------------
 int main(int argc, char **argv) {
     if (argc < 5) {
-        fprintf(stderr, "usage: %s <input|-> <out_dir> <limit> <jobs>\n", argv[0]);
+        fprintf(stderr, "usage: %s <input|-> <out_dir> <limit> <jobs> [range]\n", argv[0]);
         return 2;
     }
     Chess_Init();  // read-only tables, shared by all workers
@@ -340,6 +413,11 @@ int main(int argc, char **argv) {
     long limit = atol(argv[3]);
     int jobs = atoi(argv[4]);
     if (jobs < 1) jobs = 1;
+    // mode: "range" = mid-file range (frame-sync + skip leading partial + stop at
+    // span); "head" = first range (starts at byte 0, stop at span, no skip).
+    int head_mode = argc >= 6 && strcmp(argv[5], "head") == 0;
+    int range_mode = head_mode || (argc >= 6 && strcmp(argv[5], "range") == 0);
+    long range_bytes = (range_mode && argc >= 7) ? atol(argv[6]) : 0;
 
     Queue q;
     q_init(&q);
@@ -357,7 +435,9 @@ int main(int argc, char **argv) {
         pthread_create(&threads[i], NULL, worker_main, &workers[i]);
     }
 
-    Reader rd = {.in_movetext = 0, .scanned = 0, .accepted = 0, .limit = limit, .q = &q, .done = 0};
+    Reader rd = {.in_movetext = 0, .scanned = 0, .accepted = 0, .limit = limit, .q = &q,
+                 .done = 0, .syncing = range_mode && !head_mode, .prev_blank = 0,
+                 .range_bytes = range_bytes, .consumed = 0};
     game_reset(&rd.g);
 
     size_t in_cap = ZSTD_DStreamInSize();
@@ -369,30 +449,24 @@ int main(int argc, char **argv) {
     char *line = malloc(line_cap);
     size_t line_len = 0;
 
-    size_t read;
-    while (!rd.done && (read = fread(in_buf, 1, in_cap, in)) > 0) {
-        ZSTD_inBuffer input = {in_buf, read, 0};
-        while (input.pos < input.size && !rd.done) {
-            ZSTD_outBuffer output = {out_buf, out_cap, 0};
-            size_t ret = ZSTD_decompressStream(dctx, &output, &input);
-            if (ZSTD_isError(ret)) {
-                fprintf(stderr, "zstd error: %s\n", ZSTD_getErrorName(ret));
-                rd.done = 1;
-                break;
-            }
-            for (size_t i = 0; i < output.pos; i++) {
-                char ch = out_buf[i];
-                if (ch == '\n') {
-                    if (line_len && line[line_len - 1] == '\r') line_len--;
-                    line[line_len] = '\0';
-                    handle_line(&rd, line);
-                    line_len = 0;
-                } else if (line_len + 1 < line_cap) {
-                    line[line_len++] = ch;
-                }
-            }
+    if (range_mode && !head_mode) {
+        // sync to the next frame boundary, then feed the tail of the sync buffer
+        size_t sn;
+        long off;
+        unsigned char *sb = frame_sync(in, &sn, &off);
+        if (off >= 0) {
+            rd.consumed = (size_t)off;  // bytes discarded belong to this range's span
+            process_input(dctx, &rd, sb + off, sn - (size_t)off, out_buf, out_cap, line,
+                          &line_len, line_cap);
+        } else {
+            rd.done = 1;
         }
+        free(sb);
     }
+
+    size_t read;
+    while (!rd.done && (read = fread(in_buf, 1, in_cap, in)) > 0)
+        process_input(dctx, &rd, in_buf, read, out_buf, out_cap, line, &line_len, line_cap);
 
     q_close(&q);
     for (int i = 0; i < jobs; i++) pthread_join(threads[i], NULL);

@@ -53,11 +53,19 @@ uv run python native/difftest_replay.py  --games 20000
 - **Parallel download** — the dominant cost at scale. The Lichess CDN throttles
   **per connection** (~3.3 MB/s measured) but scales almost linearly across
   connections (8 → ~25 MB/s). Single-connection, the full 31 GB file would take
-  ~2.6 h just to transfer. So `--engine c` on a URL uses
-  `chess_graph.ingest.fetch.parallel_fetch` — N HTTP range connections (with
-  Retry-After backoff + resume) downloading the needed prefix to disk — then
-  runs the producer on it. For a sample the prefix size is estimated from
-  `--limit`; for a full month it's the whole file.
+  ~2.6 h just to transfer. Two modes (`fetch.py`):
+  - **Sample** (`--engine c --jobs N`, a `--limit`): `parallel_fetch` — N range
+    connections (Retry-After backoff + resume) pull the estimated prefix to
+    disk, then the producer runs on it.
+  - **Full file** (`--engine c --jobs N --limit 0`): `run_fused` — N connections
+    each download a byte-range and **pipe it straight into a range-mode
+    producer**, so each pipe overlaps its own download with its replay. The
+    producer frame-syncs to the next pzstd frame boundary, owns whole frames
+    (stopping at the frame boundary once its span is consumed, with a download
+    margin to finish the straddling frame), and skips its leading partial game —
+    so frames are owned by exactly one connection. Verified against the
+    single-stream path: **−1 game in 398,425** (one boundary artifact; invisible
+    after the min-games prune).
 
 ## Use it
 
@@ -99,10 +107,8 @@ bounded by download bandwidth.
 
 ## Not yet done
 
-- **Fused download+replay** — today it downloads the prefix, then replays. Since
-  the file is multi-frame, each worker could own an HTTP range + decompress +
-  replay, overlapping download with CPU (saves ~10 min on a full month). The
-  CDN also 429s on connection bursts, so this needs backoff/concurrency limits.
-- **Corpus producer** — the full-game corpus (`ingest-games`) is still Python.
-- **Reader parallelism** — the single decompress/filter thread caps replay
-  scaling at ~4 workers.
+- **Corpus producer** — the full-game corpus (`ingest-games`) is still Python;
+  the same C approach applies.
+- **Exactness at range boundaries** — the fused full-file path loses ~1 game per
+  few range boundaries (frame-boundary artifact). Negligible for the aggregated
+  graph; the prefix/sample and single-stream paths remain byte-exact.

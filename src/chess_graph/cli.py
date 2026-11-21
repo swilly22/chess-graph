@@ -90,37 +90,48 @@ def run_ingest(
         engine_label = "c"
         is_url = (source is None) or source.startswith(("http://", "https://"))
 
-        # URL: parallel-download the needed prefix (the CDN throttles per
-        # connection, so N connections ~= N x bandwidth), then run the producer.
-        # Local file: read directly.
+        # URL + no limit (full file): fully fused -- N connections each download a
+        # range and pipe it to a range-mode producer (download overlaps replay).
+        # URL + limit (sample): parallel-download the needed prefix, then producer.
+        # Local file: producer reads directly.
+        counters = IngestCounters()
+        fused = is_url and limit <= 0
         prefix_path: str | None = None
-        if is_url:
-            from chess_graph.ingest.fetch import estimate_prefix_bytes, parallel_fetch
+        if fused:
+            from chess_graph.ingest.fetch import run_fused
 
             conns = min(jobs, 8)
-            nbytes = estimate_prefix_bytes(src, limit)
-            prefix_path = os.path.join(out_dir, "c_source.zst")
-            _log(f"parallel-downloading ~{nbytes >> 20} MB with {conns} connections...")
-            parallel_fetch(src, prefix_path, nbytes, conns=conns)
-            producer_input = prefix_path
+            _log(f"fused parallel download+replay from URL with {conns} connections...")
+            scanned, accepted = run_fused(src, str(producer), shards_dir, conns=conns)
+            counters.scanned, counters.accepted = scanned, accepted
+            shard_glob = f"{shards_dir}/r*"
         else:
-            producer_input = source
-        _log(f"running native producer (jobs={jobs}) ...")
-        prod = subprocess.run(
-            [str(producer), producer_input, shards_dir, str(limit), str(jobs)],
-            capture_output=True, text=True,
-        )
-        stderr = prod.stderr
-        if prefix_path:
-            try:
-                os.remove(prefix_path)
-            except OSError:
-                pass
-        _log(stderr.strip())
-        counters = IngestCounters()
-        m = re.search(r"scanned=(\d+) accepted=(\d+)", stderr)
-        if m:
-            counters.scanned, counters.accepted = int(m.group(1)), int(m.group(2))
+            if is_url:
+                from chess_graph.ingest.fetch import estimate_prefix_bytes, parallel_fetch
+
+                conns = min(jobs, 8)
+                nbytes = estimate_prefix_bytes(src, limit)
+                prefix_path = os.path.join(out_dir, "c_source.zst")
+                _log(f"parallel-downloading ~{nbytes >> 20} MB with {conns} connections...")
+                parallel_fetch(src, prefix_path, nbytes, conns=conns)
+                producer_input = prefix_path
+            else:
+                producer_input = source
+            _log(f"running native producer (jobs={jobs}) ...")
+            prod = subprocess.run(
+                [str(producer), producer_input, shards_dir, str(limit), str(jobs)],
+                capture_output=True, text=True,
+            )
+            _log(prod.stderr.strip())
+            m = re.search(r"scanned=(\d+) accepted=(\d+)", prod.stderr)
+            if m:
+                counters.scanned, counters.accepted = int(m.group(1)), int(m.group(2))
+            if prefix_path:
+                try:
+                    os.remove(prefix_path)
+                except OSError:
+                    pass
+            shard_glob = shards_dir
 
         con = duckdb.connect(duckdb_path)
         con.execute("SET memory_limit = '8GB'")
@@ -128,11 +139,11 @@ def run_ingest(
         if temp_dir:
             con.execute(f"SET temp_directory = '{temp_dir}'")
         pos_src = (
-            f"read_csv('{shards_dir}/pos_*.csv', header=false, "
+            f"read_csv('{shard_glob}/pos_*.csv', header=false, "
             "columns={'key':'BIGINT','epd':'VARCHAR','is_blitz':'BOOLEAN','bracket':'UTINYINT'})"
         )
         edge_src = (
-            f"read_csv('{shards_dir}/edge_*.csv', header=false, columns={{'frm':'BIGINT',"
+            f"read_csv('{shard_glob}/edge_*.csv', header=false, columns={{'frm':'BIGINT',"
             "'t':'BIGINT','uci':'VARCHAR','san':'VARCHAR','is_blitz':'BOOLEAN',"
             "'bracket':'UTINYINT','result':'UTINYINT'})"
         )
