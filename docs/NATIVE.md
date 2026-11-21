@@ -42,35 +42,54 @@ uv run python native/difftest_identity.py --games 20000
 uv run python native/difftest_replay.py  --games 20000
 ```
 
+## Parallel + streaming
+
+The producer is multithreaded and streams:
+
+- **Parallel** — one reader thread (decompress + header filter) feeds a bounded
+  queue; `<jobs>` worker threads replay and write per-worker CSV shards. The
+  engine's lookup tables are read-only after `Chess_Init()` and each worker owns
+  its board, so no locking and **no engine changes**.
+- **Streaming** — the producer reads compressed bytes from a file or stdin
+  (`-`), so the CLI pipes `curl <url> | producer -`: the download overlaps the
+  replay, and early-abort at `--limit` closes the pipe (stopping the transfer).
+
 ## Use it
 
 ```bash
-uv run python -m chess_graph.cli ingest-sample --engine c --source data/month.pgn.zst
+# local file, 8 workers
+uv run python -m chess_graph.cli ingest-sample --engine c --jobs 8 --source data/month.pgn.zst
+# stream straight from the Lichess dump (no --source; download overlaps replay)
+uv run python -m chess_graph.cli ingest-sample --engine c --jobs 8 --month 2026-10 --limit 1000000
 ```
 
-`--engine c` runs the native producer, aggregates its CSV shards with the same
-DuckDB SQL as the Python path, and loads `chess_core` — output is **identical**
-to the Python engine (verified on a 25k sample: pos 338,782→674, edges
-343,767→891, accepted 15,396).
+`--engine c` runs the producer, aggregates its CSV shards with the same DuckDB
+SQL as the Python path, and loads `chess_core` — output is **byte-identical** to
+the Python engine (verified at 25k and 150k games).
 
-## Measured
+## Measured (11-core machine)
 
-| | 25k-game sample, no load |
-|---|---|
-| Python engine (`--engine duckdb`, 1 proc) | 18.1 s |
-| **Native C (`--engine c`)** | **0.96 s (~19×)** |
-| producer alone (parse+replay+emit) | 0.53 s user (~29k accepted games/s) |
+Same 150k-game sample, no load, identical output (accepted 91,597;
+pos 1,860,355→4,230; edges 1,894,672→6,104):
 
-Full-month projection (~55M accepted games): ~25 h (single-process Python) →
-~45–60 min (single-threaded C). The producer is embarrassingly parallel, so
-sharding the input across cores would bring that to minutes.
+| Path | Time | Speedup |
+|---|---|---|
+| Python engine (`--engine duckdb`, 1 proc) | 154.3 s | 1× |
+| Python engine (`--jobs 8`) | ~27 s | ~5.7× |
+| **Native C (`--engine c --jobs 8`)** | **2.5 s** | **~61×** |
+
+Producer-only scaling (parse+replay+emit, 150k games): jobs 1 → 4.27 s,
+jobs 4 → 1.25 s, jobs 8 → 1.16 s (~79k accepted games/s; plateaus at ~4 as the
+serial reader/decompress becomes the limit). Streaming 50k games live from the
+dump (download + decompress + 8-way replay + aggregate): ~2.5 s end-to-end.
+
+Full-month projection (~55M accepted games): ~25 h (single Python) → ~12–15 min
+(C `--jobs 8` producer + DuckDB aggregate), bounded increasingly by download
+bandwidth and the serial decompress.
 
 ## Not yet done
 
-- **HTTP streaming in C** — the producer reads a local `.zst`; streaming the
-  dump directly would need libcurl (today: download first, or keep Python
-  streaming for the live dump).
-- **Parallel producer** — currently single-threaded; shard the input or thread
-  the replay for month-in-minutes.
 - **Corpus producer** — the full-game corpus (`ingest-games`) is still Python;
   the same C approach applies.
+- **Further reader parallelism** — the single decompress/filter thread caps
+  scaling at ~4 workers; a multi-frame/seekable split would push it higher.

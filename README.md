@@ -44,9 +44,16 @@ the exact-N cut deterministic), workers replay into DuckDB/Parquet shards, and
 the final aggregation runs once over the union. Output is identical to
 single-process; measured ~5.7× for the opening graph and ~4.2× for the corpus.
 
-For full-month scale there's also a **native C producer** (`--engine c`, reads a
-local `.pgn.zst`) that's ~19× faster than the single-process Python engine with
-byte-identical output. See [`docs/NATIVE.md`](docs/NATIVE.md).
+For full-month scale there's also a **native C producer** (`--engine c`), which
+is multithreaded (`--jobs N`) and streams the dump as it downloads
+(`curl | producer`). Byte-identical output, **~61× faster** than the
+single-process Python engine (150k games: 154 s → 2.5 s). See
+[`docs/NATIVE.md`](docs/NATIVE.md).
+
+```bash
+# stream from the Lichess dump, 8 workers, straight into chess_core
+uv run python -m chess_graph.cli ingest-sample --engine c --jobs 8 --month 2026-10 --limit 1000000
+```
 
 The dump is streamed and abandoned once `--limit` accepted games are read, so
 only a few hundred MB of the ~29 GB file is transferred.

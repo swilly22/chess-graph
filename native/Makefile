@@ -18,7 +18,7 @@ replay_games: replay_games.c replay.c replay.h chessid.c chessid.h polyglot_rand
 	$(CC) $(CFLAGS) $(ENGINE_INC) -I. -o replay_games replay_games.c replay.c chessid.c $(ENGINE_SRC)
 
 producer: producer.c replay.c replay.h chessid.c chessid.h polyglot_random.h $(ENGINE_SRC)
-	$(CC) $(CFLAGS) $(ENGINE_INC) -I. $(ZSTD_CFLAGS) -o producer \
+	$(CC) $(CFLAGS) -pthread $(ENGINE_INC) -I. $(ZSTD_CFLAGS) -o producer \
 		producer.c replay.c chessid.c $(ENGINE_SRC) $(ZSTD_LIBS)
 
 clean:

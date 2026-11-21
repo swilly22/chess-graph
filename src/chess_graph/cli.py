@@ -68,7 +68,6 @@ def run_ingest(
     t0 = time.monotonic()
     closers: list = []  # objects to .close() after loading
     parts_dir: str | None = None
-    csv_files: list[str] = []
 
     if engine == "c":
         import duckdb
@@ -79,25 +78,40 @@ def run_ingest(
             iter_node_rows,
         )
 
-        if not source or source.startswith(("http://", "https://")):
-            raise SystemExit("--engine c requires a local .pgn.zst via --source")
         producer = _REPO_ROOT / "native" / "producer"
         if not producer.exists():
             raise SystemExit("build the native producer first: make -C native producer")
 
         out_dir = temp_dir or os.path.dirname(duckdb_path) or "."
-        os.makedirs(out_dir, exist_ok=True)
-        pos_csv = os.path.join(out_dir, "c_pos_visits.csv")
-        edge_csv = os.path.join(out_dir, "c_edge_visits.csv")
+        shards_dir = os.path.join(out_dir, "c_shards")
+        shutil.rmtree(shards_dir, ignore_errors=True)
+        os.makedirs(shards_dir, exist_ok=True)
+        parts_dir = shards_dir  # cleaned up after load
         engine_label = "c"
-        _log(f"running native producer on {source} (limit={limit:,}) ...")
-        proc = subprocess.run(
-            [str(producer), source, pos_csv, edge_csv, str(limit)],
-            capture_output=True, text=True,
-        )
-        _log(proc.stderr.strip())
+        is_url = source and source.startswith(("http://", "https://"))
+
+        # URL: stream it in (curl | producer -) so download overlaps the replay
+        # and early-abort stops the transfer. Local file: read directly.
+        _log(f"running native producer (jobs={jobs}) on {source or src} ...")
+        if is_url or source is None:
+            curl = subprocess.Popen(["curl", "-sL", src], stdout=subprocess.PIPE)
+            prod = subprocess.Popen(
+                [str(producer), "-", shards_dir, str(limit), str(jobs)],
+                stdin=curl.stdout, stderr=subprocess.PIPE, text=True,
+            )
+            curl.stdout.close()  # producer now owns the read end
+            _, stderr = prod.communicate()
+            curl.terminate()
+            curl.wait()
+        else:
+            prod = subprocess.run(
+                [str(producer), source, shards_dir, str(limit), str(jobs)],
+                capture_output=True, text=True,
+            )
+            stderr = prod.stderr
+        _log(stderr.strip())
         counters = IngestCounters()
-        m = re.search(r"scanned=(\d+) accepted=(\d+)", proc.stderr)
+        m = re.search(r"scanned=(\d+) accepted=(\d+)", stderr)
         if m:
             counters.scanned, counters.accepted = int(m.group(1)), int(m.group(2))
 
@@ -107,13 +121,13 @@ def run_ingest(
         if temp_dir:
             con.execute(f"SET temp_directory = '{temp_dir}'")
         pos_src = (
-            f"read_csv('{pos_csv}', header=false, "
+            f"read_csv('{shards_dir}/pos_*.csv', header=false, "
             "columns={'key':'BIGINT','epd':'VARCHAR','is_blitz':'BOOLEAN','bracket':'UTINYINT'})"
         )
         edge_src = (
-            f"read_csv('{edge_csv}', header=false, columns={{'frm':'BIGINT','t':'BIGINT',"
-            "'uci':'VARCHAR','san':'VARCHAR','is_blitz':'BOOLEAN','bracket':'UTINYINT',"
-            "'result':'UTINYINT'})"
+            f"read_csv('{shards_dir}/edge_*.csv', header=false, columns={{'frm':'BIGINT',"
+            "'t':'BIGINT','uci':'VARCHAR','san':'VARCHAR','is_blitz':'BOOLEAN',"
+            "'bracket':'UTINYINT','result':'UTINYINT'})"
         )
         s = build_positions_and_moves(con, pos_src, edge_src, cfg.min_games_per_position)
         aggregate_seconds = time.monotonic() - t0
@@ -122,7 +136,6 @@ def run_ingest(
         node_rows, edge_rows = iter_node_rows(con), iter_edge_rows(con, first_seen)
         san_errors = 0
         closers.append(con)
-        csv_files += [pos_csv, edge_csv]
     elif jobs > 1:
         # Parallel: workers replay into visit shards, then one DuckDB GROUP BY.
         from chess_graph.ingest.aggregate_duckdb import ShardVisitAggregator
@@ -251,11 +264,6 @@ def run_ingest(
         obj.close()
     if parts_dir:
         shutil.rmtree(parts_dir, ignore_errors=True)
-    for path in csv_files:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
     report["peak_rss_mb"] = _peak_rss_mb()
     return report
 
