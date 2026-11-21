@@ -106,6 +106,26 @@ docker compose ps           # check health
 docker compose down         # stop (graph persists in the named volume)
 ```
 
+The named volume mounts FalkorDB's data dir (`/var/lib/falkordb/data`), so the
+graph survives `docker compose down`/`up`.
+
+### Back up / restore the graph
+
+```bash
+# back up to a durable host file (outside the Docker volume)
+docker exec chess_falkordb redis-cli SAVE
+docker cp chess_falkordb:/var/lib/falkordb/data/dump.rdb data/backups/chess_core_enriched.rdb
+
+# restore: write the backup into the volume while the server is STOPPED, then start
+docker stop chess_falkordb
+docker run --rm -v chess_falkordb_data:/vol -v "$PWD/data/backups":/bak alpine \
+  cp /bak/chess_core_enriched.rdb /vol/dump.rdb
+docker start chess_falkordb
+```
+
+Restore writes while stopped because a running server would save its current
+(empty) state over the file on shutdown.
+
 ## Project layout
 
 ```

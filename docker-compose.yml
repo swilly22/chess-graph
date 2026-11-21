@@ -15,7 +15,9 @@ services:
       - "6379:6379" # RESP protocol — Cypher via GRAPH.QUERY
       - "3000:3000" # FalkorDB Browser (web UI)
     volumes:
-      - falkordb_data:/data
+      # FalkorDB's data dir (dir=/var/lib/falkordb/data) — this is where dump.rdb
+      # lives, so the named volume must mount here to actually persist the graph.
+      - falkordb_data:/var/lib/falkordb/data
     # Tuning is passed to the module via FALKORDB_ARGS. Defaults are fine for
     # the sample build; revisit NODE_CREATION_BUFFER / query mem at full scale.
     environment:
