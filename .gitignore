@@ -22,6 +22,11 @@ data/
 .env
 .env.local
 
+# C build artifacts
+native/hash_fen
+native/*.o
+*.dSYM/
+
 # OS / editor
 .DS_Store
 .idea/
