@@ -12,11 +12,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import resource
 import shutil
+import subprocess
 import sys
 import time
 from dataclasses import asdict
+from pathlib import Path
 
 from chess_graph.config import PipelineConfig, load_config
 from chess_graph.ingest.aggregate import Aggregator
@@ -27,6 +30,8 @@ from chess_graph.ingest.pgn_stream import IngestCounters, iter_accepted_games, i
 from chess_graph.ingest.prune import prune
 from chess_graph.ingest.source import month_url, open_zst_lines
 from chess_graph.load import falkor
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _log(msg: str) -> None:
@@ -63,8 +68,62 @@ def run_ingest(
     t0 = time.monotonic()
     closers: list = []  # objects to .close() after loading
     parts_dir: str | None = None
+    csv_files: list[str] = []
 
-    if jobs > 1:
+    if engine == "c":
+        import duckdb
+
+        from chess_graph.ingest.aggregate_duckdb import (
+            build_positions_and_moves,
+            iter_edge_rows,
+            iter_node_rows,
+        )
+
+        if not source or source.startswith(("http://", "https://")):
+            raise SystemExit("--engine c requires a local .pgn.zst via --source")
+        producer = _REPO_ROOT / "native" / "producer"
+        if not producer.exists():
+            raise SystemExit("build the native producer first: make -C native producer")
+
+        out_dir = temp_dir or os.path.dirname(duckdb_path) or "."
+        os.makedirs(out_dir, exist_ok=True)
+        pos_csv = os.path.join(out_dir, "c_pos_visits.csv")
+        edge_csv = os.path.join(out_dir, "c_edge_visits.csv")
+        engine_label = "c"
+        _log(f"running native producer on {source} (limit={limit:,}) ...")
+        proc = subprocess.run(
+            [str(producer), source, pos_csv, edge_csv, str(limit)],
+            capture_output=True, text=True,
+        )
+        _log(proc.stderr.strip())
+        counters = IngestCounters()
+        m = re.search(r"scanned=(\d+) accepted=(\d+)", proc.stderr)
+        if m:
+            counters.scanned, counters.accepted = int(m.group(1)), int(m.group(2))
+
+        con = duckdb.connect(duckdb_path)
+        con.execute("SET memory_limit = '8GB'")
+        con.execute("PRAGMA threads = 4")
+        if temp_dir:
+            con.execute(f"SET temp_directory = '{temp_dir}'")
+        pos_src = (
+            f"read_csv('{pos_csv}', header=false, "
+            "columns={'key':'BIGINT','epd':'VARCHAR','is_blitz':'BOOLEAN','bracket':'UTINYINT'})"
+        )
+        edge_src = (
+            f"read_csv('{edge_csv}', header=false, columns={{'frm':'BIGINT','t':'BIGINT',"
+            "'uci':'VARCHAR','san':'VARCHAR','is_blitz':'BOOLEAN','bracket':'UTINYINT',"
+            "'result':'UTINYINT'})"
+        )
+        s = build_positions_and_moves(con, pos_src, edge_src, cfg.min_games_per_position)
+        aggregate_seconds = time.monotonic() - t0
+        pos_before, pos_after = s.positions_before, s.positions_after
+        edge_before, edge_after = s.edges_before, s.edges_after
+        node_rows, edge_rows = iter_node_rows(con), iter_edge_rows(con, first_seen)
+        san_errors = 0
+        closers.append(con)
+        csv_files += [pos_csv, edge_csv]
+    elif jobs > 1:
         # Parallel: workers replay into visit shards, then one DuckDB GROUP BY.
         from chess_graph.ingest.aggregate_duckdb import ShardVisitAggregator
         from chess_graph.ingest.parallel import run_opening_parallel
@@ -192,6 +251,11 @@ def run_ingest(
         obj.close()
     if parts_dir:
         shutil.rmtree(parts_dir, ignore_errors=True)
+    for path in csv_files:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
     report["peak_rss_mb"] = _peak_rss_mb()
     return report
 
@@ -290,8 +354,8 @@ def main(argv: list[str] | None = None) -> int:
     ing.add_argument("--source", default=None, help="override source URL or local .pgn.zst path")
     ing.add_argument("--no-load", action="store_true", help="aggregate + prune only, skip FalkorDB")
     ing.add_argument(
-        "--engine", choices=["memory", "duckdb"], default="memory",
-        help="aggregation engine: 'memory' for small samples, 'duckdb' for the full 1M run",
+        "--engine", choices=["memory", "duckdb", "c"], default="memory",
+        help="engine: 'memory'/'duckdb' (Python replay) or 'c' (native producer, local .zst)",
     )
     ing.add_argument("--duckdb-path", default="data/aggregate.duckdb", help="on-disk DuckDB file")
     ing.add_argument("--temp-dir", default=None, help="DuckDB spill directory")

@@ -44,6 +44,10 @@ the exact-N cut deterministic), workers replay into DuckDB/Parquet shards, and
 the final aggregation runs once over the union. Output is identical to
 single-process; measured ~5.7× for the opening graph and ~4.2× for the corpus.
 
+For full-month scale there's also a **native C producer** (`--engine c`, reads a
+local `.pgn.zst`) that's ~19× faster than the single-process Python engine with
+byte-identical output. See [`docs/NATIVE.md`](docs/NATIVE.md).
+
 The dump is streamed and abandoned once `--limit` accepted games are read, so
 only a few hundred MB of the ~29 GB file is transferred.
 
