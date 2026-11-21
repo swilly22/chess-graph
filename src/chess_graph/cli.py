@@ -445,6 +445,12 @@ def main(argv: list[str] | None = None) -> int:
     eop.add_argument("--dir", default="data/openings", help="dir with a.tsv..e.tsv")
     eop.add_argument("--report", default=None, help="write the JSON report to this path")
 
+    gpz = sub.add_parser("generate-puzzles", help="generate opening puzzles from the graph")
+    gpz.add_argument("--only-move-gap", type=int, default=150)
+    gpz.add_argument("--punish-delta", type=int, default=-150)
+    gpz.add_argument("--min-games", type=int, default=50)
+    gpz.add_argument("--report", default=None, help="write the JSON report to this path")
+
     eev = sub.add_parser("enrich-evals", help="local Stockfish evals over positions + edges")
     eev.add_argument("--depth", type=int, default=None, help="fixed depth (else use --movetime)")
     eev.add_argument("--movetime", type=int, default=120, help="ms per position")
@@ -489,6 +495,15 @@ def main(argv: list[str] | None = None) -> int:
         from chess_graph.enrich.openings import enrich_openings
 
         report = _asdict(enrich_openings(cfg, args.dir))
+    elif args.command == "generate-puzzles":
+        from dataclasses import asdict as _asdict
+
+        from chess_graph.puzzles.generate import generate_puzzles
+
+        report = _asdict(generate_puzzles(
+            cfg, created_at=int(time.time()), only_move_gap=args.only_move_gap,
+            punish_delta=args.punish_delta, min_games=args.min_games,
+        ))
     elif args.command == "enrich-evals":
         from dataclasses import asdict as _asdict
 
