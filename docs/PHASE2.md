@@ -65,6 +65,26 @@ Measured run, not estimates. Raw report: [`phase2_report.json`](phase2_report.js
 - **`Game` nodes.** N/A for the Lichess sample (aggregated into stats, not
   stored). Revisit only when loading curated model/master games.
 
+## Full-game corpus (same 1M sample)
+
+Separate from the opening graph: complete games recorded to Parquet for puzzle
+mining across all phases (`ingest-games`). See `docs/SCHEMA.md` → "Full-game
+corpus".
+
+| Metric | Value |
+|---|---|
+| Games | 1,000,000 |
+| Total plies recorded | 66,916,930 (avg **66.9**, max 600) |
+| Throughput | **1,272 games/s** (13.1 min) — faster than the graph (no per-ply hashing) |
+| Games with free Lichess `[%eval]` | 125,606 (**12.6%**) |
+| Truncated (bad SAN) | 0 |
+| Parquet size | 112.7 MB |
+| Peak RSS | 3.8 GB |
+
+~89% of games extend past the 30-ply opening cap, and ~95% of the eval-carrying
+games contain a ≥300cp swing → ~120k candidate "punish" puzzles from free evals
+alone, before any Stockfish.
+
 ## Reproduce
 
 ```bash

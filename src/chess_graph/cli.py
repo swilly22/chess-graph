@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import resource
 import sys
 import time
@@ -19,7 +20,9 @@ from dataclasses import asdict
 from chess_graph.config import PipelineConfig, load_config
 from chess_graph.ingest.aggregate import Aggregator
 from chess_graph.ingest.aggregate_duckdb import DuckDBAggregator
-from chess_graph.ingest.pgn_stream import IngestCounters, iter_accepted_games
+from chess_graph.ingest.fullgame import parse_full_game
+from chess_graph.ingest.games_store import GamesCorpusWriter
+from chess_graph.ingest.pgn_stream import IngestCounters, iter_accepted_games, iter_raw_games
 from chess_graph.ingest.prune import prune
 from chess_graph.ingest.source import month_url, open_zst_lines
 from chess_graph.load import falkor
@@ -151,6 +154,66 @@ def run_ingest(
     return report
 
 
+def run_ingest_games(
+    cfg: PipelineConfig,
+    month: str,
+    limit: int,
+    source: str | None,
+    out_parquet: str,
+    duckdb_path: str,
+    progress_every: int,
+) -> dict:
+    """Stream, filter, and record COMPLETE games into the Parquet corpus."""
+    src = source or month_url(month)
+    counters = IngestCounters()
+    writer = GamesCorpusWriter(duckdb_path, out_parquet)
+
+    _log(f"streaming {src}  (full-game corpus)")
+    _log(f"target accepted games: {limit:,}")
+    t0 = time.monotonic()
+    with open_zst_lines(src) as lines:
+        for headers, movetext in iter_raw_games(lines):
+            counters.scanned += 1
+            game = parse_full_game(headers, movetext, cfg, counters)
+            if game is not None:
+                counters.accepted += 1
+                writer.add(game)
+                if counters.accepted % progress_every == 0:
+                    elapsed = time.monotonic() - t0
+                    rate = counters.accepted / elapsed if elapsed else 0
+                    _log(f"  {counters.accepted:,} games | {rate:,.0f} games/s")
+                if counters.accepted >= limit:
+                    break
+    parse_seconds = time.monotonic() - t0
+    rate = counters.accepted / parse_seconds if parse_seconds else 0
+
+    _log("writing Parquet corpus...")
+    writer.finalize()
+    stats = writer.stats()
+    size_mb = round(os.path.getsize(out_parquet) / (1024 * 1024), 1)
+    writer.close()
+    _log(f"corpus: {stats.games:,} games, {stats.total_plies:,} plies, {size_mb} MB")
+
+    return {
+        "mode": "full-game-corpus",
+        "month": month,
+        "out": out_parquet,
+        "scanned": counters.scanned,
+        "accepted": counters.accepted,
+        "parse_seconds": round(parse_seconds, 1),
+        "games_per_second": round(rate, 0),
+        "total_plies": stats.total_plies,
+        "avg_plies": stats.avg_plies,
+        "max_plies": stats.max_plies,
+        "games_with_eval": stats.games_with_eval,
+        "eval_coverage": stats.eval_coverage,
+        "truncated_games": stats.truncated,
+        "distinct_game_ids": stats.distinct_ids,
+        "parquet_mb": size_mb,
+        "peak_rss_mb": _peak_rss_mb(),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="chess_graph")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -172,6 +235,21 @@ def main(argv: list[str] | None = None) -> int:
     ing.add_argument("--progress-every", type=int, default=50_000)
     ing.add_argument("--report", default=None, help="write the JSON report to this path")
 
+    games = sub.add_parser(
+        "ingest-games", help="stream and record COMPLETE games into a Parquet corpus"
+    )
+    games.add_argument("--month", default="2026-10", help="YYYY-MM Lichess dump")
+    games.add_argument(
+        "--limit", type=int, default=None, help="max accepted games (default: config sample size)"
+    )
+    games.add_argument("--source", default=None, help="override source URL or local .pgn.zst path")
+    games.add_argument(
+        "--out", default=None, help="output Parquet path (default data/games_<month>.parquet)"
+    )
+    games.add_argument("--duckdb-path", default="data/games.duckdb", help="on-disk DuckDB file")
+    games.add_argument("--progress-every", type=int, default=50_000)
+    games.add_argument("--report", default=None, help="write the JSON report to this path")
+
     args = parser.parse_args(argv)
     cfg = load_config()
 
@@ -182,13 +260,22 @@ def main(argv: list[str] | None = None) -> int:
             progress_every=args.progress_every, engine=args.engine,
             duckdb_path=args.duckdb_path, temp_dir=args.temp_dir,
         )
-        text = json.dumps(report, indent=2)
-        print(text)
-        if args.report:
-            with open(args.report, "w") as fh:
-                fh.write(text)
-        return 0
-    return 1
+    elif args.command == "ingest-games":
+        limit = args.limit if args.limit is not None else cfg.sample_target_games
+        out = args.out or f"data/games_{args.month}.parquet"
+        report = run_ingest_games(
+            cfg, args.month, limit, args.source, out_parquet=out,
+            duckdb_path=args.duckdb_path, progress_every=args.progress_every,
+        )
+    else:
+        return 1
+
+    text = json.dumps(report, indent=2)
+    print(text)
+    if args.report:
+        with open(args.report, "w") as fh:
+            fh.write(text)
+    return 0
 
 
 if __name__ == "__main__":

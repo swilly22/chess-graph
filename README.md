@@ -39,6 +39,20 @@ uv run python -m chess_graph.cli ingest-sample --month 2026-10 --limit 1000000 \
 The dump is streamed and abandoned once `--limit` accepted games are read, so
 only a few hundred MB of the ~29 GB file is transferred.
 
+### Full-game corpus (for puzzle generation)
+
+The opening graph only keeps the first 30 plies. Puzzle generation (mate
+patterns, tactics, best-move) needs **whole games across all phases**, so a
+separate command records complete games — full UCI move lists plus any Lichess
+`[%eval]` annotations — into a Parquet corpus (`data/games_<month>.parquet`).
+This corpus is offline (not in FalkorDB); the Phase-4 generator + Stockfish mine
+it, and only the resulting puzzles land in the graph.
+
+```bash
+uv run python -m chess_graph.cli ingest-games --month 2026-10 --limit 1000000 \
+  --out data/games_2026-10.parquet --report games_report.json
+```
+
 ## Setup
 
 ```bash
@@ -76,6 +90,8 @@ src/chess_graph/
     aggregate.py         in-memory position/edge aggregation + SAN tokenizer
     aggregate_duckdb.py  DuckDB-backed aggregation (bounded memory, for 1M)
     prune.py             min-games prune + edge endpoint survival
+    fullgame.py          whole-game parser (all plies, metadata, [%eval])
+    games_store.py       full-game Parquet corpus writer (puzzle substrate)
   load/
     falkor.py            schema (indexes/constraints) + batched UNWIND loaders
 tests/

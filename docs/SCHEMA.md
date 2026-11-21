@@ -225,3 +225,36 @@ GRAPH.CONSTRAINT CREATE chess_user_<id> UNIQUE NODE UPosition PROPERTIES 1 key
 GRAPH.CONSTRAINT CREATE chess_user_<id> UNIQUE NODE UGame PROPERTIES 1 id
 GRAPH.CONSTRAINT CREATE chess_user_<id> MANDATORY RELATIONSHIP REP_MOVE PROPERTIES 1 uci
 ```
+
+## Full-game corpus (Parquet, offline)
+
+This is **not** in FalkorDB. The opening graph (`chess_core`) stores the
+aggregated opening; puzzle generation needs *whole games* across all phases, so
+complete games are recorded to a columnar Parquet file
+(`data/games_<month>.parquet`) built by `chess_graph.ingest.games_store`. It is
+the offline substrate that the phase-4 puzzle generator (+ Stockfish) mines;
+only the generated `Puzzle` nodes (and their setup positions) land in the graph.
+
+Games are filtered by the exact same predicate as the opening sample (standard,
+rated, non-bullet, rating diff ≤ 400), so the two corpora cover the same
+population.
+
+### `games` table
+
+| Column | Type | Notes |
+|---|---|---|
+| `game_id` | VARCHAR | Lichess id (last path segment of `Site`) |
+| `source` | VARCHAR | `lichess` |
+| `white_elo`, `black_elo` | INTEGER | |
+| `bracket` | UTINYINT | 0–5, same bracketing as the graph |
+| `tc` | VARCHAR | `blitz` or `slow` |
+| `result` | VARCHAR | `w` / `d` / `b` (White win / draw / Black win) |
+| `termination` | VARCHAR | `Normal`, `Time forfeit`, `Abandoned`, … |
+| `eco` | VARCHAR | ECO code from the PGN header |
+| `opening` | VARCHAR | Opening name from the PGN header |
+| `played_at` | BIGINT | epoch seconds (UTC), 0 if unknown |
+| `ply_count` | INTEGER | number of plies recorded (whole game) |
+| `moves_uci` | VARCHAR[] | full move list in UCI, all phases |
+| `evals_cp` | INTEGER[] | per-ply Lichess `[%eval]` in `eval_cp` units (mate sentinel), aligned to `moves_uci`; `NULL` where a move had no eval; empty list when `has_eval` is false |
+| `has_eval` | BOOLEAN | whether the game carried any `[%eval]` annotations |
+| `truncated` | BOOLEAN | a SAN failed to parse; the valid prefix was kept |

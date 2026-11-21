@@ -1,0 +1,18 @@
+{
+  "mode": "full-game-corpus",
+  "month": "2026-10",
+  "out": "/Users/roilipman/Dev/chess/data/games_2026-10.parquet",
+  "scanned": 1610941,
+  "accepted": 1000000,
+  "parse_seconds": 786.0,
+  "games_per_second": 1272.0,
+  "total_plies": 66916930,
+  "avg_plies": 66.9,
+  "max_plies": 600,
+  "games_with_eval": 125606,
+  "eval_coverage": 0.1256,
+  "truncated_games": 0,
+  "distinct_game_ids": 1000000,
+  "parquet_mb": 112.7,
+  "peak_rss_mb": 3820.8
+}
