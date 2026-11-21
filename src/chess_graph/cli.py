@@ -304,6 +304,22 @@ def run_ingest_games(
     src = source or month_url(month)
     counters = IngestCounters()
 
+    # URL: parallel-download the needed prefix first (the CDN throttles per
+    # connection, so this is the dominant speedup), then ingest the local file.
+    prefix_path: str | None = None
+    download_seconds = 0.0
+    if src.startswith(("http://", "https://")):
+        from chess_graph.ingest.fetch import estimate_prefix_bytes, parallel_fetch
+
+        conns = min(8, jobs) if jobs > 1 else 8
+        nbytes = estimate_prefix_bytes(src, limit)
+        prefix_path = os.path.join(os.path.dirname(duckdb_path) or ".", "games_source.zst")
+        _log(f"parallel-downloading ~{nbytes >> 20} MB with {conns} connections...")
+        dt0 = time.monotonic()
+        parallel_fetch(src, prefix_path, nbytes, conns=conns)
+        download_seconds = time.monotonic() - dt0
+        src = prefix_path
+
     _log(f"streaming {src}  (full-game corpus, jobs={jobs})")
     _log(f"target accepted games: {limit:,}")
     t0 = time.monotonic()
@@ -345,6 +361,11 @@ def run_ingest_games(
     rate = counters.accepted / parse_seconds if parse_seconds else 0
     size_mb = round(os.path.getsize(out_parquet) / (1024 * 1024), 1)
     _log(f"corpus: {stats.games:,} games, {stats.total_plies:,} plies, {size_mb} MB")
+    if prefix_path:
+        try:
+            os.remove(prefix_path)
+        except OSError:
+            pass
 
     return {
         "mode": "full-game-corpus",
@@ -353,6 +374,7 @@ def run_ingest_games(
         "out": out_parquet,
         "scanned": counters.scanned,
         "accepted": counters.accepted,
+        "download_seconds": round(download_seconds, 1),
         "parse_seconds": round(parse_seconds, 1),
         "games_per_second": round(rate, 0),
         "total_plies": stats.total_plies,

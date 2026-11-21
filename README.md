@@ -76,7 +76,9 @@ Add `--jobs N` to fan the move replay across worker processes (the main process
 streams + filters; workers replay and write Parquet shards that are combined at
 the end). Measured ~4.2× end-to-end at `--jobs 8` on this 11-core machine;
 output is identical to single-process. The GIL blocks threads, so this uses
-processes — and `ingest/parallel.py` is the reusable driver.
+processes — and `ingest/parallel.py` is the reusable driver. URL sources are
+**parallel-downloaded** first (the CDN throttles per connection), which is the
+dominant speedup at scale.
 
 ```bash
 uv run python -m chess_graph.cli ingest-games --month 2026-10 --limit 1000000 --jobs 8 \
