@@ -42,17 +42,22 @@ uv run python native/difftest_identity.py --games 20000
 uv run python native/difftest_replay.py  --games 20000
 ```
 
-## Parallel + streaming
+## Parallel replay, parallel download
 
-The producer is multithreaded and streams:
-
-- **Parallel** — one reader thread (decompress + header filter) feeds a bounded
-  queue; `<jobs>` worker threads replay and write per-worker CSV shards. The
-  engine's lookup tables are read-only after `Chess_Init()` and each worker owns
-  its board, so no locking and **no engine changes**.
+- **Parallel replay** — one reader thread (decompress + header filter) feeds a
+  bounded queue; `<jobs>` worker threads replay and write per-worker CSV shards.
+  The engine's lookup tables are read-only after `Chess_Init()` and each worker
+  owns its board, so no locking and **no engine changes**.
 - **Streaming** — the producer reads compressed bytes from a file or stdin
-  (`-`), so the CLI pipes `curl <url> | producer -`: the download overlaps the
-  replay, and early-abort at `--limit` closes the pipe (stopping the transfer).
+  (`-`), so it can be fed from a pipe.
+- **Parallel download** — the dominant cost at scale. The Lichess CDN throttles
+  **per connection** (~3.3 MB/s measured) but scales almost linearly across
+  connections (8 → ~25 MB/s). Single-connection, the full 31 GB file would take
+  ~2.6 h just to transfer. So `--engine c` on a URL uses
+  `chess_graph.ingest.fetch.parallel_fetch` — N HTTP range connections (with
+  Retry-After backoff + resume) downloading the needed prefix to disk — then
+  runs the producer on it. For a sample the prefix size is estimated from
+  `--limit`; for a full month it's the whole file.
 
 ## Use it
 
@@ -83,13 +88,21 @@ jobs 4 → 1.25 s, jobs 8 → 1.16 s (~79k accepted games/s; plateaus at ~4 as t
 serial reader/decompress becomes the limit). Streaming 50k games live from the
 dump (download + decompress + 8-way replay + aggregate): ~2.5 s end-to-end.
 
-Full-month projection (~55M accepted games): ~25 h (single Python) → ~12–15 min
-(C `--jobs 8` producer + DuckDB aggregate), bounded increasingly by download
-bandwidth and the serial decompress.
+End-to-end from the live URL (`--engine c --jobs 8`, 200k games, no load):
+parallel download (~297 MB, 8 conns) + producer + aggregate in **~29 s**, with a
+clean early-abort at exactly 200,000 accepted.
+
+Full-month projection (~55M accepted, 31 GB): single-connection download alone
+is ~2.6 h; with 8-way parallel download (~25 MB/s) it's ~20 min, and the
+replay (~12 min at `--jobs 8`) overlaps/follows — so **~20–30 min** total,
+bounded by download bandwidth.
 
 ## Not yet done
 
-- **Corpus producer** — the full-game corpus (`ingest-games`) is still Python;
-  the same C approach applies.
-- **Further reader parallelism** — the single decompress/filter thread caps
-  scaling at ~4 workers; a multi-frame/seekable split would push it higher.
+- **Fused download+replay** — today it downloads the prefix, then replays. Since
+  the file is multi-frame, each worker could own an HTTP range + decompress +
+  replay, overlapping download with CPU (saves ~10 min on a full month). The
+  CDN also 429s on connection bursts, so this needs backoff/concurrency limits.
+- **Corpus producer** — the full-game corpus (`ingest-games`) is still Python.
+- **Reader parallelism** — the single decompress/filter thread caps replay
+  scaling at ~4 workers.

@@ -88,27 +88,34 @@ def run_ingest(
         os.makedirs(shards_dir, exist_ok=True)
         parts_dir = shards_dir  # cleaned up after load
         engine_label = "c"
-        is_url = source and source.startswith(("http://", "https://"))
+        is_url = (source is None) or source.startswith(("http://", "https://"))
 
-        # URL: stream it in (curl | producer -) so download overlaps the replay
-        # and early-abort stops the transfer. Local file: read directly.
-        _log(f"running native producer (jobs={jobs}) on {source or src} ...")
-        if is_url or source is None:
-            curl = subprocess.Popen(["curl", "-sL", src], stdout=subprocess.PIPE)
-            prod = subprocess.Popen(
-                [str(producer), "-", shards_dir, str(limit), str(jobs)],
-                stdin=curl.stdout, stderr=subprocess.PIPE, text=True,
-            )
-            curl.stdout.close()  # producer now owns the read end
-            _, stderr = prod.communicate()
-            curl.terminate()
-            curl.wait()
+        # URL: parallel-download the needed prefix (the CDN throttles per
+        # connection, so N connections ~= N x bandwidth), then run the producer.
+        # Local file: read directly.
+        prefix_path: str | None = None
+        if is_url:
+            from chess_graph.ingest.fetch import estimate_prefix_bytes, parallel_fetch
+
+            conns = min(jobs, 8)
+            nbytes = estimate_prefix_bytes(src, limit)
+            prefix_path = os.path.join(out_dir, "c_source.zst")
+            _log(f"parallel-downloading ~{nbytes >> 20} MB with {conns} connections...")
+            parallel_fetch(src, prefix_path, nbytes, conns=conns)
+            producer_input = prefix_path
         else:
-            prod = subprocess.run(
-                [str(producer), source, shards_dir, str(limit), str(jobs)],
-                capture_output=True, text=True,
-            )
-            stderr = prod.stderr
+            producer_input = source
+        _log(f"running native producer (jobs={jobs}) ...")
+        prod = subprocess.run(
+            [str(producer), producer_input, shards_dir, str(limit), str(jobs)],
+            capture_output=True, text=True,
+        )
+        stderr = prod.stderr
+        if prefix_path:
+            try:
+                os.remove(prefix_path)
+            except OSError:
+                pass
         _log(stderr.strip())
         counters = IngestCounters()
         m = re.search(r"scanned=(\d+) accepted=(\d+)", stderr)
