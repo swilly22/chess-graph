@@ -441,6 +441,10 @@ def main(argv: list[str] | None = None) -> int:
     est = sub.add_parser("enrich-structures", help="link positions to pawn structures")
     est.add_argument("--report", default=None, help="write the JSON report to this path")
 
+    eop = sub.add_parser("enrich-openings", help="load Opening nodes + NAMED/SUBVARIATION_OF")
+    eop.add_argument("--dir", default="data/openings", help="dir with a.tsv..e.tsv")
+    eop.add_argument("--report", default=None, help="write the JSON report to this path")
+
     args = parser.parse_args(argv)
     cfg = load_config()
 
@@ -472,6 +476,12 @@ def main(argv: list[str] | None = None) -> int:
         from chess_graph.enrich.pawn_structure import enrich_structures
 
         report = _asdict(enrich_structures(cfg))
+    elif args.command == "enrich-openings":
+        from dataclasses import asdict as _asdict
+
+        from chess_graph.enrich.openings import enrich_openings
+
+        report = _asdict(enrich_openings(cfg, args.dir))
     else:
         return 1
 
