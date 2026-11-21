@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import resource
+import shutil
 import sys
 import time
 from dataclasses import asdict
@@ -54,50 +55,88 @@ def run_ingest(
     engine: str,
     duckdb_path: str,
     temp_dir: str | None,
+    jobs: int = 1,
+    chunk_size: int = 2_000,
 ) -> dict:
     src = source or month_url(month)
-    counters = IngestCounters()
     first_seen = _first_seen(month)
-    if engine == "duckdb":
-        agg: Aggregator | DuckDBAggregator = DuckDBAggregator(
-            cfg, first_seen, db_path=duckdb_path, temp_dir=temp_dir
-        )
-    else:
-        agg = Aggregator(cfg, first_seen)
-
-    _log(f"streaming {src}  (engine={engine})")
-    _log(f"target accepted games: {limit:,}")
     t0 = time.monotonic()
-    with open_zst_lines(src) as lines:
-        for game in iter_accepted_games(lines, cfg, counters):
-            agg.add_game(game)
-            if agg.games_aggregated % progress_every == 0:
-                elapsed = time.monotonic() - t0
-                rate = agg.games_aggregated / elapsed if elapsed else 0
-                extra = (
-                    f"{len(agg.positions):,} pos | {len(agg.edges):,} edges | "
-                    if isinstance(agg, Aggregator)
-                    else ""
-                )
-                _log(f"  {agg.games_aggregated:,} games | {extra}{rate:,.0f} games/s")
-            if agg.games_aggregated >= limit:
-                break
-    aggregate_seconds = time.monotonic() - t0
-    rate = agg.games_aggregated / aggregate_seconds if aggregate_seconds else 0
-    _log(f"aggregation done in {aggregate_seconds:,.1f}s ({rate:,.0f} games/s)")
+    closers: list = []  # objects to .close() after loading
+    parts_dir: str | None = None
 
-    # Aggregate + prune, producing row iterators the loader can consume.
-    if isinstance(agg, DuckDBAggregator):
-        dstats = agg.finalize()
-        pos_before, pos_after = dstats.positions_before, dstats.positions_after
-        edge_before, edge_after = dstats.edges_before, dstats.edges_after
-        node_rows, edge_rows = agg.node_rows(), agg.edge_rows()
+    if jobs > 1:
+        # Parallel: workers replay into visit shards, then one DuckDB GROUP BY.
+        from chess_graph.ingest.aggregate_duckdb import ShardVisitAggregator
+        from chess_graph.ingest.parallel import run_opening_parallel
+
+        engine_label = "duckdb-parallel"
+        _log(f"streaming {src}  (engine={engine_label}, jobs={jobs})")
+        _log(f"target accepted games: {limit:,}")
+
+        def _progress(accepted: int) -> None:
+            if accepted % progress_every < chunk_size:
+                elapsed = time.monotonic() - t0
+                r = accepted / elapsed if elapsed else 0
+                _log(f"  {accepted:,} games | {r:,.0f} games/s")
+
+        parts_dir = duckdb_path + ".parts"
+        counters, san_errors, pos_glob, edge_glob = run_opening_parallel(
+            cfg, src, limit, jobs, chunk_size, parts_dir, first_seen, _progress
+        )
+        aggregate_seconds = time.monotonic() - t0
+        _log("aggregating visit shards...")
+        shard_agg = ShardVisitAggregator(
+            cfg, first_seen, pos_glob, edge_glob, duckdb_path, temp_dir=temp_dir
+        )
+        s = shard_agg.stats
+        pos_before, pos_after = s.positions_before, s.positions_after
+        edge_before, edge_after = s.edges_before, s.edges_after
+        node_rows, edge_rows = shard_agg.node_rows(), shard_agg.edge_rows()
+        closers.append(shard_agg)
     else:
-        pr = prune(agg, cfg.min_games_per_position)
-        pos_before, pos_after = pr.positions_before, pr.positions_after
-        edge_before, edge_after = pr.edges_before, pr.edges_after
-        node_rows = falkor._node_rows(agg.positions, pr.survivors)
-        edge_rows = falkor._edge_rows(pr.edges)
+        engine_label = engine
+        counters = IngestCounters()
+        if engine == "duckdb":
+            agg: Aggregator | DuckDBAggregator = DuckDBAggregator(
+                cfg, first_seen, db_path=duckdb_path, temp_dir=temp_dir
+            )
+        else:
+            agg = Aggregator(cfg, first_seen)
+
+        _log(f"streaming {src}  (engine={engine})")
+        _log(f"target accepted games: {limit:,}")
+        with open_zst_lines(src) as lines:
+            for game in iter_accepted_games(lines, cfg, counters):
+                agg.add_game(game)
+                if agg.games_aggregated % progress_every == 0:
+                    elapsed = time.monotonic() - t0
+                    r = agg.games_aggregated / elapsed if elapsed else 0
+                    extra = (
+                        f"{len(agg.positions):,} pos | {len(agg.edges):,} edges | "
+                        if isinstance(agg, Aggregator)
+                        else ""
+                    )
+                    _log(f"  {agg.games_aggregated:,} games | {extra}{r:,.0f} games/s")
+                if agg.games_aggregated >= limit:
+                    break
+        aggregate_seconds = time.monotonic() - t0
+        san_errors = agg.san_errors
+
+        if isinstance(agg, DuckDBAggregator):
+            dstats = agg.finalize()
+            pos_before, pos_after = dstats.positions_before, dstats.positions_after
+            edge_before, edge_after = dstats.edges_before, dstats.edges_after
+            node_rows, edge_rows = agg.node_rows(), agg.edge_rows()
+            closers.append(agg)
+        else:
+            pr = prune(agg, cfg.min_games_per_position)
+            pos_before, pos_after = pr.positions_before, pr.positions_after
+            edge_before, edge_after = pr.edges_before, pr.edges_after
+            node_rows = falkor._node_rows(agg.positions, pr.survivors)
+            edge_rows = falkor._edge_rows(pr.edges)
+
+    rate = counters.accepted / aggregate_seconds if aggregate_seconds else 0
+    _log(f"aggregation done in {aggregate_seconds:,.1f}s ({rate:,.0f} games/s)")
     _log(
         f"pruned (min_games={cfg.min_games_per_position}): "
         f"positions {pos_before:,} -> {pos_after:,} | edges {edge_before:,} -> {edge_after:,}"
@@ -106,7 +145,8 @@ def run_ingest(
     report: dict = {
         "month": month,
         "limit": limit,
-        "engine": engine,
+        "engine": engine_label,
+        "jobs": jobs,
         "scanned": counters.scanned,
         "accepted": counters.accepted,
         "accept_rate": round(counters.accepted / counters.scanned, 4) if counters.scanned else None,
@@ -118,7 +158,7 @@ def run_ingest(
             "time_control": counters.rejected_time_control,
             "result": counters.rejected_result,
         },
-        "san_errors": agg.san_errors,
+        "san_errors": san_errors,
         "aggregate_seconds": round(aggregate_seconds, 1),
         "games_per_second": round(rate, 0),
         "positions_before_prune": pos_before,
@@ -148,8 +188,10 @@ def run_ingest(
             f"{stats.edges_loaded:,} edges in {stats.edge_seconds:,.1f}s"
         )
 
-    if isinstance(agg, DuckDBAggregator):
-        agg.close()
+    for obj in closers:
+        obj.close()
+    if parts_dir:
+        shutil.rmtree(parts_dir, ignore_errors=True)
     report["peak_rss_mb"] = _peak_rss_mb()
     return report
 
@@ -253,6 +295,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     ing.add_argument("--duckdb-path", default="data/aggregate.duckdb", help="on-disk DuckDB file")
     ing.add_argument("--temp-dir", default=None, help="DuckDB spill directory")
+    ing.add_argument(
+        "--jobs", type=int, default=1,
+        help="worker processes for replay (>1 forces the parallel DuckDB path)",
+    )
+    ing.add_argument("--chunk-size", type=int, default=2_000, help="games per worker task")
     ing.add_argument("--progress-every", type=int, default=50_000)
     ing.add_argument("--report", default=None, help="write the JSON report to this path")
 
@@ -285,6 +332,7 @@ def main(argv: list[str] | None = None) -> int:
             cfg, args.month, limit, args.source, do_load=not args.no_load,
             progress_every=args.progress_every, engine=args.engine,
             duckdb_path=args.duckdb_path, temp_dir=args.temp_dir,
+            jobs=args.jobs, chunk_size=args.chunk_size,
         )
     elif args.command == "ingest-games":
         limit = args.limit if args.limit is not None else cfg.sample_target_games

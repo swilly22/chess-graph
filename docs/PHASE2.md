@@ -54,12 +54,14 @@ Measured run, not estimates. Raw report: [`phase2_report.json`](phase2_report.js
   game, barely saturating): 17.9M positions at 1M games would need ~28–30 GB —
   unsafe here. The DuckDB engine held it to a configurable 8 GB. **Keep DuckDB
   for any run ≥ ~300k games; the in-memory engine is for small samples/tests.**
-- **Parser scaling.** Single-process python-chess does ~600–1,270 games/s. For
-  samples, `--jobs` fans the replay across processes — measured **~4.2× end-to-
-  end** on the corpus (100k: 82 s → 19 s), ~7.5× in the replay phase alone. The
-  GIL blocks threads, so this uses processes, not threads. A full month (~90M+
-  games) would still take hours even parallelized; if that's needed, move the
-  parse/replay to a **C** layer (not Rust) keeping the same identity rules.
+- **Parser scaling.** Single-process python-chess does ~600 games/s (opening
+  graph) / ~1,270 (corpus). `--jobs` fans the replay across processes — measured
+  (same 100k, 11 cores): **opening graph 171 s → 30 s (~5.7×)**, **corpus 82 s →
+  19 s (~4.2×)**. The opening path gains more because it also hashes/dedups per
+  ply. Output is identical to single-process (row-for-row, test-enforced). The
+  GIL blocks threads, so this uses processes. A full month (~90M+ games) would
+  still take hours even parallelized; if that's needed, move the parse/replay to
+  a **C** layer (not Rust) keeping the same identity rules.
 - **Frequency floor (`min_games = 20`).** Yields a clean 49k-node graph from 1M
   games (0.27% of pre-prune positions survive). Reasonable to keep provisional;
   revisit against a larger sample and the explorer's depth needs.

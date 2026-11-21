@@ -41,6 +41,125 @@ class DuckStats:
     edges_after: int = 0
 
 
+def _positions_sql(source: str, min_games: int) -> str:
+    return f"""
+        CREATE OR REPLACE TABLE positions AS
+        SELECT key, any_value(epd) AS epd, CAST(count(*) AS BIGINT) AS games,
+               {_bracket_sums('rb', 'is_blitz')},
+               {_bracket_sums('rs', 'NOT is_blitz')}
+        FROM {source}
+        GROUP BY key
+        HAVING count(*) >= {min_games}
+    """
+
+
+def _moves_sql(source: str) -> str:
+    return f"""
+        CREATE OR REPLACE TABLE moves AS
+        SELECT e.frm AS frm, e.t AS t,
+               any_value(e.uci) AS uci, any_value(e.san) AS san,
+               CAST(count(*) AS BIGINT) AS games,
+               {_bracket_sums('bw', 'is_blitz AND result = 0')},
+               {_bracket_sums('bd', 'is_blitz AND result = 1')},
+               {_bracket_sums('bb', 'is_blitz AND result = 2')},
+               {_bracket_sums('sw', 'NOT is_blitz AND result = 0')},
+               {_bracket_sums('sd', 'NOT is_blitz AND result = 1')},
+               {_bracket_sums('sb', 'NOT is_blitz AND result = 2')}
+        FROM {source} e
+        SEMI JOIN positions pf ON e.frm = pf.key
+        SEMI JOIN positions pt ON e.t = pt.key
+        GROUP BY e.frm, e.t
+    """
+
+
+def build_positions_and_moves(con, pos_source: str, edge_source: str, min_games: int) -> DuckStats:
+    """Run the GROUP BY + prune over ``pos_source``/``edge_source`` (a table name
+    or a ``read_parquet('...')`` expression), creating `positions` and `moves`."""
+    con.execute(_positions_sql(pos_source, min_games))
+    con.execute(_moves_sql(edge_source))
+    stats = DuckStats()
+    stats.positions_before = con.execute(
+        f"SELECT count(DISTINCT key) FROM {pos_source}"
+    ).fetchone()[0]
+    stats.edges_before = con.execute(
+        f"SELECT count(DISTINCT (frm, t)) FROM {edge_source}"
+    ).fetchone()[0]
+    stats.positions_after = con.execute("SELECT count(*) FROM positions").fetchone()[0]
+    stats.edges_after = con.execute("SELECT count(*) FROM moves").fetchone()[0]
+    return stats
+
+
+def iter_node_rows(con, batch: int = 10_000) -> Iterator[dict]:
+    cur = con.execute(
+        "SELECT key, epd, games, rb0, rb1, rb2, rb3, rb4, rb5, "
+        "rs0, rs1, rs2, rs3, rs4, rs5 FROM positions"
+    )
+    while rows := cur.fetchmany(batch):
+        for r in rows:
+            _, side, castling, _ep = r[1].split(" ", 3)
+            yield {
+                "key": r[0], "epd": r[1], "side": side, "castling": castling,
+                "games": r[2],
+                "reach_blitz": list(r[3:9]),
+                "reach_slow": list(r[9:15]),
+            }
+
+
+def iter_edge_rows(con, first_seen: int, batch: int = 10_000) -> Iterator[dict]:
+    cur = con.execute(
+        "SELECT frm, t, uci, san, games, "
+        "bw0,bw1,bw2,bw3,bw4,bw5, bd0,bd1,bd2,bd3,bd4,bd5, bb0,bb1,bb2,bb3,bb4,bb5, "
+        "sw0,sw1,sw2,sw3,sw4,sw5, sd0,sd1,sd2,sd3,sd4,sd5, sb0,sb1,sb2,sb3,sb4,sb5 "
+        "FROM moves"
+    )
+    while rows := cur.fetchmany(batch):
+        for r in rows:
+            yield {
+                "a": r[0], "b": r[1], "uci": r[2], "san": r[3], "games": r[4],
+                "bw": list(r[5:11]), "bd": list(r[11:17]), "bb": list(r[17:23]),
+                "sw": list(r[23:29]), "sd": list(r[29:35]), "sb": list(r[35:41]),
+                "fs": first_seen,
+            }
+
+
+class ShardVisitAggregator:
+    """Aggregate pos/edge visit Parquet shards (from parallel workers) into the
+    final `positions`/`moves`, using the same SQL as the serial engine."""
+
+    def __init__(
+        self,
+        cfg: PipelineConfig,
+        first_seen: int,
+        pos_glob: str,
+        edge_glob: str,
+        db_path: str,
+        memory_limit: str = "8GB",
+        temp_dir: str | None = None,
+        threads: int = 4,
+    ) -> None:
+        self.first_seen = first_seen
+        self.con = duckdb.connect(db_path)
+        self.con.execute(f"SET memory_limit = '{memory_limit}'")
+        self.con.execute(f"PRAGMA threads = {threads}")
+        if temp_dir:
+            self.con.execute(f"SET temp_directory = '{temp_dir}'")
+        self.stats = build_positions_and_moves(
+            self.con,
+            f"read_parquet('{pos_glob}')",
+            f"read_parquet('{edge_glob}')",
+            cfg.min_games_per_position,
+        )
+
+    def node_rows(self, batch: int = 10_000) -> Iterator[dict]:
+        return iter_node_rows(self.con, batch)
+
+    def edge_rows(self, batch: int = 10_000) -> Iterator[dict]:
+        return iter_edge_rows(self.con, self.first_seen, batch)
+
+    def close(self) -> None:
+        self.con.close()
+
+
 class DuckDBAggregator:
     """Streams position/edge visits into DuckDB; aggregates + prunes in SQL."""
 
@@ -126,81 +245,23 @@ class DuckDBAggregator:
         self._flush()
         self._pos_app.flush()
         self._edge_app.flush()
+        return build_positions_and_moves(
+            self.con, "pos_visits", "edge_visits", self.cfg.min_games_per_position
+        )
 
-        min_games = self.cfg.min_games_per_position
-        self.con.execute(
-            f"""
-            CREATE OR REPLACE TABLE positions AS
-            SELECT key,
-                   any_value(epd) AS epd,
-                   CAST(count(*) AS BIGINT) AS games,
-                   {_bracket_sums('rb', 'is_blitz')},
-                   {_bracket_sums('rs', 'NOT is_blitz')}
-            FROM pos_visits
-            GROUP BY key
-            HAVING count(*) >= {min_games}
-            """
-        )
-        self.con.execute(
-            f"""
-            CREATE OR REPLACE TABLE moves AS
-            SELECT e.frm AS frm, e.t AS t,
-                   any_value(e.uci) AS uci, any_value(e.san) AS san,
-                   CAST(count(*) AS BIGINT) AS games,
-                   {_bracket_sums('bw', 'is_blitz AND result = 0')},
-                   {_bracket_sums('bd', 'is_blitz AND result = 1')},
-                   {_bracket_sums('bb', 'is_blitz AND result = 2')},
-                   {_bracket_sums('sw', 'NOT is_blitz AND result = 0')},
-                   {_bracket_sums('sd', 'NOT is_blitz AND result = 1')},
-                   {_bracket_sums('sb', 'NOT is_blitz AND result = 2')}
-            FROM edge_visits e
-            SEMI JOIN positions pf ON e.frm = pf.key
-            SEMI JOIN positions pt ON e.t = pt.key
-            GROUP BY e.frm, e.t
-            """
-        )
-        stats = DuckStats()
-        stats.positions_before = self.con.execute(
-            "SELECT count(DISTINCT key) FROM pos_visits"
-        ).fetchone()[0]
-        stats.edges_before = self.con.execute(
-            "SELECT count(DISTINCT (frm, t)) FROM edge_visits"
-        ).fetchone()[0]
-        stats.positions_after = self.con.execute("SELECT count(*) FROM positions").fetchone()[0]
-        stats.edges_after = self.con.execute("SELECT count(*) FROM moves").fetchone()[0]
-        return stats
+    def export_visits(self, pos_path: str, edge_path: str) -> None:
+        """Write this shard's raw visit rows to Parquet (for parallel workers)."""
+        self._flush()
+        self._pos_app.flush()
+        self._edge_app.flush()
+        self.con.execute(f"COPY pos_visits TO '{pos_path}' (FORMAT PARQUET)")
+        self.con.execute(f"COPY edge_visits TO '{edge_path}' (FORMAT PARQUET)")
 
     def node_rows(self, batch: int = 10_000) -> Iterator[dict]:
-        cur = self.con.execute(
-            "SELECT key, epd, games, rb0, rb1, rb2, rb3, rb4, rb5, "
-            "rs0, rs1, rs2, rs3, rs4, rs5 FROM positions"
-        )
-        while rows := cur.fetchmany(batch):
-            for r in rows:
-                key, epd, games = r[0], r[1], r[2]
-                _, side, castling, _ep = epd.split(" ", 3)
-                yield {
-                    "key": key, "epd": epd, "side": side, "castling": castling,
-                    "games": games,
-                    "reach_blitz": list(r[3:9]),
-                    "reach_slow": list(r[9:15]),
-                }
+        return iter_node_rows(self.con, batch)
 
     def edge_rows(self, batch: int = 10_000) -> Iterator[dict]:
-        cur = self.con.execute(
-            "SELECT frm, t, uci, san, games, "
-            "bw0,bw1,bw2,bw3,bw4,bw5, bd0,bd1,bd2,bd3,bd4,bd5, bb0,bb1,bb2,bb3,bb4,bb5, "
-            "sw0,sw1,sw2,sw3,sw4,sw5, sd0,sd1,sd2,sd3,sd4,sd5, sb0,sb1,sb2,sb3,sb4,sb5 "
-            "FROM moves"
-        )
-        while rows := cur.fetchmany(batch):
-            for r in rows:
-                yield {
-                    "a": r[0], "b": r[1], "uci": r[2], "san": r[3], "games": r[4],
-                    "bw": list(r[5:11]), "bd": list(r[11:17]), "bb": list(r[17:23]),
-                    "sw": list(r[23:29]), "sd": list(r[29:35]), "sb": list(r[35:41]),
-                    "fs": self.first_seen,
-                }
+        return iter_edge_rows(self.con, self.first_seen, batch)
 
     def close(self) -> None:
         self.con.close()

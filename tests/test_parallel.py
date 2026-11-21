@@ -2,13 +2,23 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import duckdb
 import zstandard
 
 from chess_graph.cli import run_ingest_games
 from chess_graph.config import load_config
+from chess_graph.ingest.aggregate_duckdb import DuckDBAggregator, ShardVisitAggregator
 from chess_graph.ingest.fullgame import build_full_game, parse_full_game
-from chess_graph.ingest.pgn_stream import IngestCounters, classify, iter_raw_games
+from chess_graph.ingest.parallel import run_opening_parallel
+from chess_graph.ingest.pgn_stream import (
+    IngestCounters,
+    classify,
+    iter_accepted_games,
+    iter_raw_games,
+)
+from chess_graph.ingest.source import open_zst_lines
 
 CFG = load_config()
 
@@ -85,3 +95,35 @@ def test_parallel_exact_limit(tmp_path):
     )
     assert rep["accepted"] == 3
     assert len(_game_ids(out)) == 3
+
+
+def test_parallel_opening_matches_serial(tmp_path):
+    """The parallel opening path (visit shards -> union GROUP BY) must produce the
+    same Position/MOVE rows as the serial DuckDB aggregator."""
+    cfg = dataclasses.replace(load_config(), min_games_per_position=1)
+    src = _fixture(tmp_path)
+
+    serial = DuckDBAggregator(cfg, 202610, db_path=":memory:")
+    counters = IngestCounters()
+    with open_zst_lines(src) as lines:
+        for game in iter_accepted_games(lines, cfg, counters):
+            serial.add_game(game)
+    serial.finalize()
+    s_nodes = {r["key"]: r for r in serial.node_rows()}
+    s_edges = {(r["a"], r["b"]): r for r in serial.edge_rows()}
+
+    parts = str(tmp_path / "parts")
+    _, _, pos_glob, edge_glob = run_opening_parallel(cfg, src, 1000, 2, 2, parts, 202610)
+    shard = ShardVisitAggregator(cfg, 202610, pos_glob, edge_glob, ":memory:")
+    p_nodes = {r["key"]: r for r in shard.node_rows()}
+    p_edges = {(r["a"], r["b"]): r for r in shard.edge_rows()}
+
+    assert s_nodes.keys() == p_nodes.keys()
+    for key in s_nodes:
+        assert s_nodes[key] == p_nodes[key], key
+    assert s_edges.keys() == p_edges.keys()
+    for ekey in s_edges:
+        assert s_edges[ekey] == p_edges[ekey], ekey
+
+    shard.close()
+    serial.close()

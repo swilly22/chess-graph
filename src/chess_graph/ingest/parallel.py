@@ -17,6 +17,7 @@ from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, as_complete
 import duckdb
 
 from chess_graph.config import PipelineConfig
+from chess_graph.ingest.aggregate_duckdb import DuckDBAggregator
 from chess_graph.ingest.fullgame import build_full_game
 from chess_graph.ingest.games_store import CorpusStats, GamesCorpusWriter, stats_from_parquet
 from chess_graph.ingest.pgn_stream import IngestCounters, classify, iter_raw_games
@@ -41,10 +42,16 @@ def _accepted_chunks(
     chunk_size: int,
     counters: IngestCounters,
     progress_cb: Callable[[int], None] | None,
-) -> Iterator[list[tuple]]:
-    """Yield chunks of ``(headers, AcceptedGame)`` — filtering runs here, in the
-    reader, so the exact-``limit`` cut stays deterministic."""
-    chunk: list[tuple] = []
+    with_headers: bool = True,
+) -> Iterator[list]:
+    """Yield chunks of accepted games — filtering runs here, in the reader, so the
+    exact-``limit`` cut stays deterministic.
+
+    ``with_headers`` controls the chunk element: ``(headers, AcceptedGame)`` for
+    the corpus (needs metadata) or bare ``AcceptedGame`` for the opening graph
+    (saves pickling the header dict).
+    """
+    chunk: list = []
     with open_zst_lines(src) as lines:
         for headers, movetext in iter_raw_games(lines):
             counters.scanned += 1
@@ -52,7 +59,7 @@ def _accepted_chunks(
             if accepted is None:
                 continue
             counters.accepted += 1
-            chunk.append((headers, accepted))
+            chunk.append((headers, accepted) if with_headers else accepted)
             if len(chunk) >= chunk_size:
                 yield chunk
                 chunk = []
@@ -119,3 +126,61 @@ def run_corpus_parallel(
         pass
 
     return counters, stats
+
+
+def _opening_shard_worker(
+    chunk: list, pos_shard: str, edge_shard: str, cfg: PipelineConfig, first_seen: int
+) -> tuple[str, str, int]:
+    """Replay a chunk of accepted games into pos/edge visit Parquet shards."""
+    agg = DuckDBAggregator(cfg, first_seen, db_path=":memory:")
+    for accepted in chunk:
+        agg.add_game(accepted)
+    agg.export_visits(pos_shard, edge_shard)
+    san_errors = agg.san_errors
+    agg.close()
+    return pos_shard, edge_shard, san_errors
+
+
+def run_opening_parallel(
+    cfg: PipelineConfig,
+    src: str,
+    limit: int,
+    jobs: int,
+    chunk_size: int,
+    parts_dir: str,
+    first_seen: int,
+    progress_cb: Callable[[int], None] | None = None,
+) -> tuple[IngestCounters, int, str, str]:
+    """Replay games across workers into visit shards; return globs for the final
+    DuckDB aggregation. Returns ``(counters, san_errors, pos_glob, edge_glob)``."""
+    os.makedirs(parts_dir, exist_ok=True)
+    counters = IngestCounters()
+    san_errors = 0
+    idx = 0
+
+    with ProcessPoolExecutor(max_workers=jobs) as pool:
+        futures: set = set()
+
+        def _collect(done_futures) -> None:
+            nonlocal san_errors
+            for fut in done_futures:
+                san_errors += fut.result()[2]
+
+        chunks = _accepted_chunks(
+            cfg, src, limit, chunk_size, counters, progress_cb, with_headers=False
+        )
+        for chunk in chunks:
+            pos_shard = os.path.join(parts_dir, f"pos_{idx:05d}.parquet")
+            edge_shard = os.path.join(parts_dir, f"edge_{idx:05d}.parquet")
+            idx += 1
+            futures.add(
+                pool.submit(_opening_shard_worker, chunk, pos_shard, edge_shard, cfg, first_seen)
+            )
+            if len(futures) >= jobs * 2:
+                done, futures = wait(futures, return_when=FIRST_COMPLETED)
+                _collect(done)
+        _collect(as_completed(futures))
+
+    pos_glob = os.path.join(parts_dir, "pos_*.parquet")
+    edge_glob = os.path.join(parts_dir, "edge_*.parquet")
+    return counters, san_errors, pos_glob, edge_glob
