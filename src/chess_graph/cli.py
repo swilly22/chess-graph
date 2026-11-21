@@ -162,41 +162,62 @@ def run_ingest_games(
     out_parquet: str,
     duckdb_path: str,
     progress_every: int,
+    jobs: int = 1,
+    chunk_size: int = 5_000,
 ) -> dict:
-    """Stream, filter, and record COMPLETE games into the Parquet corpus."""
+    """Stream, filter, and record COMPLETE games into the Parquet corpus.
+
+    ``jobs > 1`` fans the move replay out across worker processes.
+    """
     src = source or month_url(month)
     counters = IngestCounters()
-    writer = GamesCorpusWriter(duckdb_path, out_parquet)
 
-    _log(f"streaming {src}  (full-game corpus)")
+    _log(f"streaming {src}  (full-game corpus, jobs={jobs})")
     _log(f"target accepted games: {limit:,}")
     t0 = time.monotonic()
-    with open_zst_lines(src) as lines:
-        for headers, movetext in iter_raw_games(lines):
-            counters.scanned += 1
-            game = parse_full_game(headers, movetext, cfg, counters)
-            if game is not None:
-                counters.accepted += 1
-                writer.add(game)
-                if counters.accepted % progress_every == 0:
-                    elapsed = time.monotonic() - t0
-                    rate = counters.accepted / elapsed if elapsed else 0
-                    _log(f"  {counters.accepted:,} games | {rate:,.0f} games/s")
-                if counters.accepted >= limit:
-                    break
+
+    if jobs > 1:
+        from chess_graph.ingest.parallel import run_corpus_parallel
+
+        def _progress(accepted: int) -> None:
+            if accepted % progress_every < chunk_size:
+                elapsed = time.monotonic() - t0
+                rate = accepted / elapsed if elapsed else 0
+                _log(f"  {accepted:,} games | {rate:,.0f} games/s")
+
+        parts_dir = out_parquet + ".parts"
+        counters, stats = run_corpus_parallel(
+            cfg, src, limit, out_parquet, jobs, chunk_size, parts_dir, _progress
+        )
+    else:
+        writer = GamesCorpusWriter(duckdb_path, out_parquet)
+        with open_zst_lines(src) as lines:
+            for headers, movetext in iter_raw_games(lines):
+                counters.scanned += 1
+                game = parse_full_game(headers, movetext, cfg, counters)
+                if game is not None:
+                    counters.accepted += 1
+                    writer.add(game)
+                    if counters.accepted % progress_every == 0:
+                        elapsed = time.monotonic() - t0
+                        rate = counters.accepted / elapsed if elapsed else 0
+                        _log(f"  {counters.accepted:,} games | {rate:,.0f} games/s")
+                    if counters.accepted >= limit:
+                        break
+        _log("writing Parquet corpus...")
+        writer.finalize()
+        stats = writer.stats()
+        writer.close()
+
     parse_seconds = time.monotonic() - t0
     rate = counters.accepted / parse_seconds if parse_seconds else 0
-
-    _log("writing Parquet corpus...")
-    writer.finalize()
-    stats = writer.stats()
     size_mb = round(os.path.getsize(out_parquet) / (1024 * 1024), 1)
-    writer.close()
     _log(f"corpus: {stats.games:,} games, {stats.total_plies:,} plies, {size_mb} MB")
 
     return {
         "mode": "full-game-corpus",
         "month": month,
+        "jobs": jobs,
         "out": out_parquet,
         "scanned": counters.scanned,
         "accepted": counters.accepted,
@@ -247,6 +268,11 @@ def main(argv: list[str] | None = None) -> int:
         "--out", default=None, help="output Parquet path (default data/games_<month>.parquet)"
     )
     games.add_argument("--duckdb-path", default="data/games.duckdb", help="on-disk DuckDB file")
+    games.add_argument(
+        "--jobs", type=int, default=1,
+        help="worker processes for move replay (1 = single-process)",
+    )
+    games.add_argument("--chunk-size", type=int, default=5_000, help="games per worker task")
     games.add_argument("--progress-every", type=int, default=50_000)
     games.add_argument("--report", default=None, help="write the JSON report to this path")
 
@@ -266,6 +292,7 @@ def main(argv: list[str] | None = None) -> int:
         report = run_ingest_games(
             cfg, args.month, limit, args.source, out_parquet=out,
             duckdb_path=args.duckdb_path, progress_every=args.progress_every,
+            jobs=args.jobs, chunk_size=args.chunk_size,
         )
     else:
         return 1

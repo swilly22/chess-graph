@@ -99,3 +99,35 @@ class GamesCorpusWriter:
 
     def close(self) -> None:
         self.con.close()
+
+
+_STATS_SQL = """
+SELECT count(*), coalesce(sum(ply_count), 0), coalesce(avg(ply_count), 0),
+       coalesce(max(ply_count), 0),
+       count(*) FILTER (WHERE has_eval),
+       count(*) FILTER (WHERE truncated),
+       count(DISTINCT game_id)
+FROM {source}
+"""
+
+
+def _stats_from_row(row: tuple) -> CorpusStats:
+    games = row[0]
+    return CorpusStats(
+        games=games,
+        total_plies=int(row[1]),
+        avg_plies=round(float(row[2]), 1),
+        max_plies=int(row[3]),
+        games_with_eval=row[4],
+        eval_coverage=round(row[4] / games, 4) if games else 0.0,
+        truncated=row[5],
+        distinct_ids=row[6],
+    )
+
+
+def stats_from_parquet(parquet_glob: str) -> CorpusStats:
+    """Compute corpus stats over one or more Parquet files (glob allowed)."""
+    con = duckdb.connect(":memory:")
+    row = con.execute(_STATS_SQL.format(source=f"read_parquet('{parquet_glob}')")).fetchone()
+    con.close()
+    return _stats_from_row(row)

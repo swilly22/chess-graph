@@ -63,7 +63,7 @@ Required unit tests for the normalization function:
 
 ## Performance expectations
 
-Pure `python-chess` is too slow to process a full month (tens of millions of games times 30 plies). Start with a sample of 1–5 million games to measure throughput, node counts, and memory. If full-month scale is needed, move the parse-and-aggregate step to a faster engine (for example the Rust `shakmaty` and `pgn-reader` crates) while keeping the same identity rules and tests.
+Pure `python-chess` is too slow to process a full month (tens of millions of games times 30 plies). Start with a sample of 1–5 million games to measure throughput, node counts, and memory. For samples, fan the work across OS processes (`--jobs`, see `ingest/parallel.py`) — the GIL blocks threads, so use processes. If full-month scale needs more than Python multiprocessing can give, move the parse-and-aggregate step to a **C** parse/replay layer (not Rust — see memory), while keeping the same identity rules and tests.
 
 ## Stack
 

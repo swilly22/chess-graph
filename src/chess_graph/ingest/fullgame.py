@@ -16,7 +16,7 @@ from dataclasses import dataclass
 import chess
 
 from chess_graph.config import PipelineConfig
-from chess_graph.ingest.pgn_stream import IngestCounters, classify
+from chess_graph.ingest.pgn_stream import AcceptedGame, IngestCounters, classify
 
 _RESULT_TOKENS = frozenset({"1-0", "0-1", "1/2-1/2", "*"})
 _MOVE_NUMBER_RE = re.compile(r"^\d+\.+")
@@ -119,20 +119,18 @@ def _played_at(headers: dict[str, str]) -> int:
         return 0
 
 
-def parse_full_game(
-    headers: dict[str, str], movetext: str, cfg: PipelineConfig, counters: IngestCounters
-) -> FullGame | None:
-    """Apply the sample filters, then extract the whole game. ``None`` if filtered."""
-    accepted = classify(headers, movetext, cfg, counters)
-    if accepted is None:
-        return None
+def build_full_game(headers: dict[str, str], accepted: AcceptedGame) -> FullGame:
+    """Build a FullGame from an already-accepted game (the expensive replay half).
 
+    Split out from :func:`parse_full_game` so the cheap header filter can run in
+    the reader process while this move replay runs in worker processes.
+    """
     board = chess.Board()
     uci: list[str] = []
     evals: list[int | None] = []
     has_eval = False
     truncated = False
-    for san, ev in iter_moves_with_eval(movetext):
+    for san, ev in iter_moves_with_eval(accepted.movetext):
         try:
             move = board.parse_san(san)
         except (ValueError, AssertionError):
@@ -162,3 +160,13 @@ def parse_full_game(
         has_eval=has_eval,
         truncated=truncated,
     )
+
+
+def parse_full_game(
+    headers: dict[str, str], movetext: str, cfg: PipelineConfig, counters: IngestCounters
+) -> FullGame | None:
+    """Apply the sample filters, then extract the whole game. ``None`` if filtered."""
+    accepted = classify(headers, movetext, cfg, counters)
+    if accepted is None:
+        return None
+    return build_full_game(headers, accepted)

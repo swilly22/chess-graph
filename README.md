@@ -53,6 +53,17 @@ uv run python -m chess_graph.cli ingest-games --month 2026-10 --limit 1000000 \
   --out data/games_2026-10.parquet --report games_report.json
 ```
 
+Add `--jobs N` to fan the move replay across worker processes (the main process
+streams + filters; workers replay and write Parquet shards that are combined at
+the end). Measured ~4.2× end-to-end at `--jobs 8` on this 11-core machine;
+output is identical to single-process. The GIL blocks threads, so this uses
+processes — and `ingest/parallel.py` is the reusable driver.
+
+```bash
+uv run python -m chess_graph.cli ingest-games --month 2026-10 --limit 1000000 --jobs 8 \
+  --out data/games_2026-10.parquet
+```
+
 ## Setup
 
 ```bash
@@ -92,6 +103,7 @@ src/chess_graph/
     prune.py             min-games prune + edge endpoint survival
     fullgame.py          whole-game parser (all plies, metadata, [%eval])
     games_store.py       full-game Parquet corpus writer (puzzle substrate)
+    parallel.py          multiprocessing driver (reader + worker pool, --jobs)
   load/
     falkor.py            schema (indexes/constraints) + batched UNWIND loaders
 tests/
