@@ -14,12 +14,16 @@ dependencies = [
     "falkordb>=1.0",
     # Out-of-core aggregation at full scale.
     "duckdb>=1.0",
+    # Thin API in front of FalkorDB.
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
     "ruff>=0.6",
+    "httpx>=0.27",  # FastAPI TestClient
 ]
 
 [build-system]

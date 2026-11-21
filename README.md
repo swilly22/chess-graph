@@ -126,6 +126,20 @@ docker start chess_falkordb
 Restore writes while stopped because a running server would save its current
 (empty) state over the file on shutdown.
 
+## Run the explorer API
+
+A thin FastAPI read layer over `chess_core` (FalkorDB is never exposed to
+clients). Explorer responses are keyed by position and cacheable.
+
+```bash
+uv run uvicorn chess_graph.api.app:app --reload
+# GET /explorer?fen=<FEN>  -> position eval/best/opening/structure, candidate
+#                             moves (per-bracket W/D/L, eval delta, is_best),
+#                             and the move orders that reach it ("reached via")
+# GET /reached-via?fen=<FEN>
+# GET /health
+```
+
 ## Project layout
 
 ```
